@@ -341,11 +341,24 @@ jobs:
           ls -lh *h3c_magic-nx30-pro-nmbm* || true
           echo
           echo "=== rootfs 与内核 ==="
+          # 本机型的 squashfs 镜像把内核与 rootfs 打进同一个 bin，不会生成独立的
+          # rootfs 文件，所以这里通常只匹配到 initramfs-kernel.bin —— 属正常，
+          # 不是缺产物。
           ls -lh *rootfs* *kernel* 2>/dev/null || true
           echo
           echo "=== 本固件的内核 vermagic ==="
-          cd ../../..
-          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' | head -1)
+          # 回到源码树根。这里必须用绝对路径，不能靠 cd ../../.. 数层级：
+          # 从 bin/targets/mediatek/filogic 往上数三级只到 bin/，下面所有
+          # bin/... 与 build_dir/... 相对路径会整片落空，而且因为 find 的管道
+          # 末位是 head（返回 0），set -e 不会拦，失败是静默的。
+          cd "$GITHUB_WORKSPACE/openwrt"
+          # 路径基准自检：这三处任一缺失，后面的 find 一律返回空，只会得到
+          # 一堆看不懂的「未编出」误报。先在这里一次性说清楚。
+          for d in build_dir bin/packages bin/targets/mediatek/filogic; do
+            [ -d "$d" ] || { echo "::error::工作目录基准错误：$d 不存在（当前 $(pwd)）"; exit 1; }
+          done
+          [ -f .config ] || { echo "::error::.config 不存在（当前 $(pwd)）"; exit 1; }
+          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' 2>/dev/null | head -1)
           if [ -n "$VF" ]; then
             echo "vermagic = $(cat "$VF")"
             echo "对照：官方 24.10.6 为 ${UPSTREAM_VERMAGIC}"
@@ -353,14 +366,17 @@ jobs:
           fi
           echo
           echo "=== 本固件自带的内核模块（这就是你拥有的全部 kmod）==="
-          find bin/targets/mediatek/filogic -name 'kmod-*' -printf '%f\n' 2>/dev/null | sort | tee kmods-built.txt | head -60
-          echo "(共 $(wc -l < kmods-built.txt) 个)"
+          # 先落盘再显示：不要让 tee 直接接 head。head 读满 60 行就关管道，
+          # tee 收到 EPIPE 立刻退出，后面的行根本没被读过，落盘的清单会被截断。
+          find bin/targets/mediatek/filogic -name 'kmod-*.ipk' -printf '%f\n' 2>/dev/null | sort > kmods-built.txt
+          head -60 kmods-built.txt
+          echo "(共 $(wc -l < kmods-built.txt) 个；完整清单已存 kmods-built.txt 并随产物上传)"
           echo
           # 这一节是「实证核对」：不看 .config 里选了什么，只看编译产物里到底有没有。
           # .config 断言能防拼写错误，但防不住「依赖解析没把包拉进来」这种情况。
           echo "=== 代理核心是否真的编出来了（实证，而非只看 .config）==="
           for p in xray-core hysteria shadowsocks-rust-sslocal; do
-            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null)
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
             if [ -n "$f" ]; then
               echo "  [已编出] $(basename "$f")"
             else
@@ -387,7 +403,7 @@ jobs:
           # 「网络已加入、Peers 也显示，但双方互相 ping 不通」，
           # 而 UCI 里的 fw_allow_* 开关不会报任何错。
           for p in zerotier luci-app-zerotier; do
-            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null)
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
             if [ -n "$f" ]; then
               echo "  [已编出] $(basename "$f")"
             else
@@ -408,7 +424,7 @@ jobs:
             done
           fi
           for p in v2ray-geoip v2ray-geosite ca-bundle chinadns-ng dns2socks ipt2socks microsocks tcping; do
-            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null)
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
             if [ -n "$f" ]; then
               echo "  [已编出] $(basename "$f")"
             else
@@ -417,7 +433,7 @@ jobs:
           done
           # TProxy 的三个内核模块缺任何一个，透明代理直接不工作
           for p in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat; do
-            f=$(find bin/targets/mediatek/filogic -name "${p}_*.ipk" -print -quit 2>/dev/null)
+            f=$(find bin/targets/mediatek/filogic -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
             if [ -n "$f" ]; then
               echo "  [已编出] $(basename "$f")"
             else
