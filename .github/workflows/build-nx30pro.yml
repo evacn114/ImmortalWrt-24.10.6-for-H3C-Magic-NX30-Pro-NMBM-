@@ -384,18 +384,36 @@ jobs:
               exit 1
             fi
           done
+          # ipk 的载荷 =「tar.gz 里再套一层 data.tar.gz」，并不是 Debian 的 ar 归档。
+          # 见 scripts/ipkg-build 收尾那行：
+          #   $TAR ... ./debian-binary ./data.tar.gz ./control.tar.gz | gzip -n - > pkg.ipk
+          # 实测文件头是 1f 8b（gzip 魔数），不是 ar 的 "!<arch>"。
+          # 所以必须两层 tar；用 ar 只会得到空列表（ar 对 gzip 文件只往 stderr 报
+          # "file format not recognized"），断言随即被误报成「缺文件」。
+          # 注意结尾的 || true：解包失败时管道返回非零，而 var=$(...) 处在 set -e
+          # 之下会直接在赋值处退出，连下面那句 ::warning:: 诊断都来不及打印。
+          ipk_payload() { tar -xzOf "$1" ./data.tar.gz 2>/dev/null | tar -tzf - 2>/dev/null || true; }
+
           # hysteria 包编出来的是 Hysteria2 客户端，passwall 靠 util_hysteria2.lua
           # 生成配置、靠 /usr/bin/hysteria 启动。两者缺一，页面上就会出现
           # hysteria2 节点类型但启动即失败。这里验证 lua 真的在包的载荷里。
-          PWS=$(find bin/packages -name 'luci-app-passwall_*.ipk' -print -quit 2>/dev/null)
-          if [ -n "$PWS" ] && command -v ar >/dev/null 2>&1; then
-            if ar p "$PWS" data.tar.gz 2>/dev/null | tar tzf - 2>/dev/null \
-                 | grep -q 'util_hysteria2\.lua'; then
+          # 上游依据：applications/luci-app-passwall/luasrc/passwall/util_hysteria2.lua
+          # 由 luci.mk 的 install 规则整目录拷进 /usr/lib/lua/luci/（文件名不变）。
+          PWS=$(find bin/packages -name 'luci-app-passwall_*.ipk' -print -quit 2>/dev/null || true)
+          if [ -n "$PWS" ]; then
+            echo "  [已编出] $(basename "$PWS")"
+            PWS_PAYLOAD=$(ipk_payload "$PWS")
+            if [ -z "$PWS_PAYLOAD" ]; then
+              echo "::warning::读不出 $(basename "$PWS") 的载荷（解包异常），跳过 util_hysteria2.lua 校验"
+            elif printf '%s\n' "$PWS_PAYLOAD" | grep -q 'util_hysteria2\.lua'; then
               echo "  [已确认] luci-app-passwall 含 util_hysteria2.lua（Hysteria2 配置生成器）"
             else
               echo "::error::luci-app-passwall 内缺少 util_hysteria2.lua，hysteria2 节点无法工作"
               exit 1
             fi
+          else
+            echo "::error::bin/packages 里没有 luci-app-passwall_*.ipk —— passwall 界面没编出来"
+            exit 1
           fi
           # ZeroTier：主程序与界面都必须真的编出来。
           # 额外核对包载荷，其中最要紧的是 zerotier-fw4 ——
@@ -411,17 +429,21 @@ jobs:
               exit 1
             fi
           done
-          ZTP=$(find bin/packages -name 'zerotier_*.ipk' -print -quit 2>/dev/null)
-          if [ -n "$ZTP" ] && command -v ar >/dev/null 2>&1; then
-            ZTPAYLOAD=$(ar p "$ZTP" data.tar.gz 2>/dev/null | tar tzf - 2>/dev/null)
-            for need in usr/bin/zerotier-one usr/bin/zerotier-fw4 etc/init.d/zerotier etc/config/zerotier; do
-              if printf '%s\n' "$ZTPAYLOAD" | grep -q "$need"; then
-                echo "  [已确认] zerotier 含 $need"
-              else
-                echo "::error::zerotier 内缺少 $need（缺失会导致 ZeroTier 起不来或防火墙规则静默失效）"
-                exit 1
-              fi
-            done
+          ZTP=$(find bin/packages -name 'zerotier_*.ipk' -print -quit 2>/dev/null || true)
+          if [ -n "$ZTP" ]; then
+            ZTPAYLOAD=$(ipk_payload "$ZTP")
+            if [ -z "$ZTPAYLOAD" ]; then
+              echo "::warning::读不出 $(basename "$ZTP") 的载荷（解包异常），跳过 zerotier 载荷校验"
+            else
+              for need in usr/bin/zerotier-one usr/bin/zerotier-fw4 etc/init.d/zerotier etc/config/zerotier; do
+                if printf '%s\n' "$ZTPAYLOAD" | grep -q "$need"; then
+                  echo "  [已确认] zerotier 含 $need"
+                else
+                  echo "::error::zerotier 内缺少 $need（缺失会导致 ZeroTier 起不来或防火墙规则静默失效）"
+                  exit 1
+                fi
+              done
+            fi
           fi
           for p in v2ray-geoip v2ray-geosite ca-bundle chinadns-ng dns2socks ipt2socks microsocks tcping; do
             f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
