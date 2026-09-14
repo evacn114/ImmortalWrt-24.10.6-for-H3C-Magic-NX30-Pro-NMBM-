@@ -272,17 +272,46 @@ jobs:
                    luci-app-ttyd luci-app-upnp openssh-sftp-server htop zram-swap; do
             chk_on "CONFIG_PACKAGE_$p" "该包静默未被选中，刷完不会有"
           done
+          # IMAGEOPT 必须先于 VERSIONOPT：VERSIONOPT 的 prompt 是
+          #   bool "Version configuration options" if IMAGEOPT
+          # （package/base-files/image-config.in L153-154），IMAGEOPT 默认 n。
+          # IMAGEOPT 若未打开，VERSIONOPT 就没有 prompt，整组 VERSION_*
+          # 子项（含 VERSION_NUMBER / VERSION_REPO）会被 make defconfig 丢弃。
           for k in CONFIG_TARGET_mediatek CONFIG_TARGET_mediatek_filogic \
-                   CONFIG_TARGET_MULTI_PROFILE CONFIG_STRIP_KERNEL_EXPORTS \
+                   CONFIG_TARGET_MULTI_PROFILE CONFIG_IMAGEOPT \
                    CONFIG_VERSIONOPT CONFIG_VERSION_FILENAMES; do
             chk_on "$k" "结构性符号，失效会导致目标/版本信息不对"
           done
+          # 这里刻意不断言 CONFIG_STRIP_KERNEL_EXPORTS：
+          # 它的 prompt 挂着 `depends on BROKEN`（config/Config-build.in L236-238），
+          # 而 BROKEN 默认 n ⇒ 该符号无 prompt ⇒ 永远不写入 .config。
+          # 断言它 =y 必然误报（曾因此把整条流水线卡死过一次）。
+          # 官方 config.buildinfo 全篇也查无此行，可交叉印证。
+          #
+          # 真正要盯的是「版本号是否真的落了地」—— 这比断言符号本身更可靠，
+          # 因为即使符号被丢弃，构建也不会报错，只会在产物名/opkg 源上悄悄走偏。
+          if ! grep -q '^CONFIG_VERSION_NUMBER="24.10.6-nx30pro"' .config; then
+            echo "::error::自定义版本号未生效 —— VERSIONOPT 很可能被丢弃了（检查 IMAGEOPT 是否打开）"
+            fail=1
+          else
+            echo "  [OK]      CONFIG_VERSION_NUMBER=\"24.10.6-nx30pro\""
+          fi
 
           echo
           echo "=== 6. 版本与 opkg 源（决定刷完后 opkg update 能否成功）==="
           grep -E '^CONFIG_VERSION_(NUMBER|REPO)=' .config || true
+          # VERSION_REPO 决定 /etc/opkg/distfeeds.conf 里的域名前缀
+          # （include/feeds.mk：src/gz %d_core %U/...，%U 即 VERSION_REPO）。
+          # 它丢失时 version.mk 会回落到 tag 默认值 —— 恰好也是同一个官方地址，
+          # 所以「源不可用」不会发生，但「自定义版本号失效」会被掩盖。
+          # 这里改成硬断言：一旦它不等于官方 24.10.6 地址，直接失败。
           if ! grep -q '^CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/releases/24.10.6"' .config; then
-            echo "::warning::VERSION_REPO 与源码 tag 不匹配，刷完后 opkg 源可能指向不存在的路径"
+            echo "::error::VERSION_REPO 未生效或指向意外地址，刷完后 opkg 源可能不可用"
+            echo "          期望: CONFIG_VERSION_REPO=\"https://downloads.immortalwrt.org/releases/24.10.6\""
+            echo "          实际: $(grep '^CONFIG_VERSION_REPO=' .config || echo '(该行不存在)')"
+            fail=1
+          else
+            echo "  [OK]      CONFIG_VERSION_REPO 指向官方 24.10.6 发布地址"
           fi
 
           echo
