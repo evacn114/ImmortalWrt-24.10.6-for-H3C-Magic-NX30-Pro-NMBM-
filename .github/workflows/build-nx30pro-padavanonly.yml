@@ -999,12 +999,31 @@ jobs:
           must_have 'MT7981_iPAiLNA_EEPROM.bin' "iPAiLNA 兜底校准缺失"
           must_have 'MT7981_ePAeLNA_EEPROM.bin' "ePAeLNA 兜底校准缺失"
           must_have '/lib/firmware/e2p'         "e2p 缺失（见 mt_wifi install 段，它与两个 EEPROM 一起装）"
-          # 下面这个是我们**刻意保留**的包（负号项只摘了 kmod-mt7915e 与
-          # kmod-mt7981-firmware）。它由 package/firmware/linux-firmware/mediatek.mk
-          # 提供，装的是 /lib/firmware/mediatek/mt7981_wo.bin，无任何依赖 ——
-          # 所以它不会反过来把 mt7915e 拉回来。确认它在，是为了证明「摘两个、
-          # 留一个」这个取舍真的按预期落地了。
-          must_have 'mt7981_wo.bin' "刻意保留的 WED 固件缺失 ⇒ CONFIG_NET_MEDIATEK_SOC_WED 的初始化可能缺件"
+          # ── mt7981_wo.bin：条件断言（2026-09-16，run #6 产物自检后订正）────
+          # 这里原来写的是硬 must_have，理由是「负号项只摘了两个，
+          # mt7981-wo-firmware 是刻意保留的」。**那个前提是错的。**
+          # padavanonly 的 commit 27c0f700ae「mediatek sdk:package files」
+          # (2025-06-19) 把 package/firmware/linux-firmware/mediatek.mk 删了
+          # 19 行（mt7981-wo-firmware ＋ mt7986-wo-firmware 两个包），同一提交
+          # 还把 package/kernel/mt76/Makefile 删了 771 行（整个开源驱动包）——
+          # 那是「全面转闭源 WiFi」的清理。设备定义 filogic.mk L1183 里那行
+          # 引用是**没同步的残留** ⇒ CONFIG_PACKAGE_mt7981-wo-firmware 成了
+          # 未知符号、被 Kconfig 静默丢弃（与 run #1 的 fullcone 同一机制）。
+          # ⇒ 闭源方案走 warp 的 WOCPU 固件（上面 7981_WOCPU0_RAM_CODE_* 已断言），
+          #   本来就不走开源 WED 路径，**镜像里没有 mt7981_wo.bin 是正确的**。
+          #
+          # 判据因此改为条件式：**包在才要求文件在**。上游哪天把该包加回来，
+          # 这里立刻恢复成硬断言；而若连 Makefile 都找不到，那是**路径错了**、
+          # 不是「包不存在」—— 必须硬失败，否则「找不到」会被伪装成「没问题」。
+          LF_MK="$GITHUB_WORKSPACE/openwrt/package/firmware/linux-firmware/mediatek.mk"
+          if [ ! -f "$LF_MK" ]; then
+            echo "::error::判据无法成立：找不到 $LF_MK（这是路径错了，不是「包不存在」）"
+            vfail=1
+          elif grep -q '^Package/mt7981-wo-firmware' "$LF_MK"; then
+            must_have 'mt7981_wo.bin' "本树有 mt7981-wo-firmware 包却装不出该文件 ⇒ 打包/安装段出了问题"
+          else
+            echo "  [预期缺失] mt7981_wo.bin（本树无 mt7981-wo-firmware 包 —— commit 27c0f700ae 转闭源时已移除）"
+          fi
           # 这三个文件的安装被 CONFIG_MTK_CHIP_MT7981 的守卫包着，
           # 而它是影子符号 —— 所以「配置自检通过」并不能保证它们进镜像。
           # 这一条断言是那个静默陷阱的最终验收。
@@ -1012,6 +1031,18 @@ jobs:
           echo
           echo "=== 8. 开源 mt76 是否真的被摘掉了（负向证据，本方案的关键）==="
           must_not '/mt7915e.ko' "开源驱动与闭源驱动争抢同一块 WMAC，会让无线行为不可预测"
+          # 负向证据的**源头**：本树根本没有开源 mt76 包 —— padavanonly 的
+          # commit 27c0f700ae 把 package/kernel/mt76/Makefile 整个删了（-771 行）。
+          # ⇒ 「镜像里没有 mt7915e.ko」不是「闭源抢赢了开源」，而是
+          #   「开源驱动压根不存在」，后者是强得多的保证。
+          # 若哪天这文件回来了，说明上游 merge 回开源驱动，那时负号项
+          # 与本节 must_not 就成了唯一防线 —— 所以这条要报出来，别静默。
+          if [ -f "$GITHUB_WORKSPACE/openwrt/package/kernel/mt76/Makefile" ]; then
+            echo "  [注意]    package/kernel/mt76 又出现了 —— 上游可能把开源驱动 merge 回来了"
+            echo "            此时负号项与上面的 must_not 是唯一防线，请复核配置"
+          else
+            echo "  [已确认无] package/kernel/mt76（本树无开源驱动包，争抢的源头已消除）"
+          fi
           # 开源射频固件：留着只是无用文件（不与闭源驱动争抢），所以只警告不失败
           for f in 'mt7981_wm.bin' 'mt7981_rom_patch.bin' 'mt7981_wa.bin'; do
             if grep -qF "$f" "$SQFS_LIST"; then
