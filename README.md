@@ -1,6 +1,5 @@
 # ImmortalWrt 24.10.6 for H3C Magic NX30 Pro (NMBM)
 
-用 GitHub Actions 自编译 H3C Magic NX30 Pro 的 ImmortalWrt 固件，内置 PassWall，面向"科学上网 + 内网约 15 台设备"的场景。
 
 > **已验证可用。** 最近一次成功构建（run `34866009485`）零错误零告警通过：三件套镜像 28 / 35 / 33 MB、内核模块 89 个、版本后缀 `-nx30pro` 均按预期产出，并自动发布为 prerelease `build-5`。
 
@@ -16,19 +15,6 @@
 
 仓库本身只有这两个文件，源码在每次构建时由 CI 现场从上游 clone，所以不存在"fork 落后上游需要同步"的问题。
 
-## 怎么用
-
-1. **把仓库设为 Public。**
-   Actions 对公开仓库免费且不计量；私有仓库每月只有 2000 分钟，而单次编译约 2–3.5 小时。
-
-2. **把两个文件放到位。**
-   `nx30pro-nmbm.config` 放仓库根目录，`build-nx30pro.yml` 放 `.github/workflows/` 下。
-
-3. **触发构建。**
-   到 Actions 页面点 *Run workflow*；或者在改动 `nx30pro-nmbm.config` 后 push，会自动触发。
-
-4. **取产物。**
-   Actions 运行页的 Artifacts 区可以下载；同时会自动发一个 prerelease，后者不需要登录 GitHub 就能下载。
 
 ## 关键参数
 
