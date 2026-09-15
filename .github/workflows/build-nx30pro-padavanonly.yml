@@ -505,6 +505,21 @@ jobs:
           chk_off CONFIG_AFALG_FALLBACK \
                   "内核符号，跟作者一致（若无 prompt，本函数会自动判为「不适用」而不误报）"
 
+          # ── §3c 作者关闭的「打包类」开关：只对我们确实会变 y 的表态 ────────
+          # 作者 44 个显式关闭里有 24 个是 CONFIG_PACKAGE_*（打包策略）。我们只
+          # 声明其中**当前确实为 y** 的两个：它们是 luci-app-rclone 的子开关，
+          # 写在 `define Package/luci-app-rclone/config` 里、**没有 depends on**，
+          # 所以宿主包不选也可见，且 default y ⇒ 不写就是 y。
+          # 我们没编 luci-app-rclone，那两行本不生效 —— 但显式关掉才能把
+          # 「不生效」变成「确实关闭」（否则哪天有人选上宿主包，两个 webui
+          # 会悄悄跟进来，其中 rclone-webui-react 是几 MB 的前端 bundle）。
+          # 其余 22 个不写：它们多半不可见，写了会被 kconfig 静默丢弃，
+          # 反而污染 §7 的「静默丢弃清单」。改由 §7b 反向体检自动兜底。
+          chk_off CONFIG_PACKAGE_luci-app-rclone_INCLUDE_rclone-webui \
+                  "默认 y 的打包子开关；我们并不编 luci-app-rclone，显式关掉以绝后患"
+          chk_off CONFIG_PACKAGE_luci-app-rclone_INCLUDE_rclone-ng \
+                  "同上：另一个 webui 前端 bundle"
+
           echo "=== 4. 用户态包（沿用上一版已逐条核对过的开关表）==="
           for p in luci luci-compat luci-theme-argon luci-app-argon-config \
                    luci-app-ttyd luci-app-upnp openssh-sftp-server htop zram-swap; do
@@ -681,44 +696,93 @@ jobs:
           echo "  （配置文件里共 $(wc -l < _want_syms.txt) 个赋值符号，其中 $(wc -l < _drop_syms.txt) 个消失）"
           echo "  影子符号（无 prompt 但有 default）本就正常消失；其余若出现，说明那一行等于没写 —— 回配置文件里删掉。"
 
-          # ── §7b 反向体检：作者显式关闭、而我们没关的符号（★ 硬断言）──────
+          # ── §7b 反向体检：作者显式关闭、而我们没关的符号 ─────────────────
           # §7 查的是「写了却不生效」；本节查互补的那一半：
           # **「没写却被默认值悄悄打开」**。这一类更阴险 —— 配置里根本没有那一行，
           # 所以任何逐行检查都看不见它，只有值能露馅。
           #
           # 判据取自**源码树里自带的**作者 defconfig
           # （defconfig/mt7981-ax3000.config），不联网、不看外部文件。
-          # kconfig 语义是「同一符号最后一行生效」，这里用「只取 is not set 行」
-          # 来复现作者的**有效**取值（作者文件里 BAND_STEERING 出现两次，
-          # 取的是后面那个 n）。
+          # 取值按 kconfig 真实语义**顺序解析、同一符号最后一行生效**
+          # （作者文件里 MTK_BAND_STEERING 先 =y 后 is not set，有效值是 n）。
           #
-          # 排除 CONFIG_TARGET_*：作者那份 defconfig 让一次构建产出 19 个机型，
-          # 我们只编 NX30 Pro —— 那是有意偏离，且由第 1 组的设备数断言兜住。
+          # 分两档判 —— 2026-09-15 修：初版对所有符号一律「值不等就 fail」，
+          # 结果 4 项误报全出在 CONFIG_PACKAGE_* 上（那属于打包策略，与我们
+          # 的需求集本来就允许不同）。教训：**判据要判在"危险"上，不是判在
+          # "不同"上**。真正的危险是**沉默** —— 我一个字没写，让 default 顶上。
+          #   · CONFIG_PACKAGE_*（打包策略）：只要我**在自己的配置里表过态**
+          #     （`=y` 有意保留 / `is not set` 有意关闭）就不算错，只列进
+          #     「有意偏离」清单供人过目；一个字都没写却变成 y/m 的 ⇒ fail。
+          #   · 其余（CONFIG_MTK_* / 内核 / openssl / pkg 安全开关…）：这些决定
+          #     **能不能编过**，零容忍 —— 值与作者不同就 fail，与我写没写无关。
+          #   · CONFIG_TARGET_*：作者那份 defconfig 一次产出 19 个机型，我们只编
+          #     NX30 Pro —— 那是有意偏离，且由第 1 组的设备数断言兜住。
           echo
           echo "=== 7b. 反向体检：作者显式关闭、我们却打开/未提及的符号 ==="
           AUTHOR_DEF=defconfig/mt7981-ax3000.config
+          OURCFG=../nx30pro-padavanonly-mtwifi.config
           if [ ! -f "$AUTHOR_DEF" ]; then
             echo "  [跳过] 源码树里没有 $AUTHOR_DEF —— 上游若挪位置，本节自动失效而不是误报"
           else
-            grep -E '^# CONFIG_[A-Za-z0-9_.+-]+ is not set[[:space:]]*$' "$AUTHOR_DEF" \
-              | awk '{print $2}' | sort -u > _author_off.txt
-            : > _reverse.txt
+            # 顺序解析、最后一行生效；只留「有效值为 n」的符号。
+            # 注意 o 里存的符号名可能含 `-` `.`，awk 数组键没问题，别用正则匹配。
+            awk '
+              /^# CONFIG_[A-Za-z0-9_.+-]+ is not set[[:space:]]*$/ { v[$2] = "n"; next }
+              /^CONFIG_[A-Za-z0-9_.+-]+=/                          { split($0, a, "="); v[a[1]] = "s" }
+              END { for (k in v) if (v[k] == "n") print k }
+            ' "$AUTHOR_DEF" | sort -u > _author_off.txt
+            : > _reverse.txt      # 硬失败：非打包类，值与作者不同
+            : > _notstated.txt    # 硬失败：打包类，我从未在配置里表态（沉默 ⇒ 默认顶上）
+            : > _contradict.txt   # 硬失败：打包类，我写了 is not set 却没生效（被 select 顶回）
+            : > _deviation.txt    # 仅提示：打包类，我明确写了 =y（有意偏离）
             while IFS= read -r sym; do
               if [ -z "$sym" ]; then continue; fi
               case "$sym" in CONFIG_TARGET_*) continue ;; esac
               # 用 -x -F 做整行定值匹配：符号里含 `-` `.`，正则会误伤
               if grep -qxF "$sym=y" .config || grep -qxF "$sym=m" .config; then
-                printf '%s\n' "$sym" >> _reverse.txt
+                case "$sym" in
+                  CONFIG_PACKAGE_*)
+                    # 我是不是**明确要它**？（=y / =m）
+                    if grep -qxF "$sym=y" "$OURCFG" || grep -qxF "$sym=m" "$OURCFG"; then
+                      printf '%s\n' "$sym" >> _deviation.txt
+                    else
+                      # 分两种：从未提及（沉默＝让 default 顶上）
+                      #           或我写了 is not set 却被顶回 y（设置没生效）
+                      if grep -qxF "# $sym is not set" "$OURCFG"; then
+                        printf '%s\n' "$sym" >> _contradict.txt
+                      else
+                        printf '%s\n' "$sym" >> _notstated.txt
+                      fi
+                    fi
+                    ;;
+                  *)
+                    printf '%s\n' "$sym" >> _reverse.txt
+                    ;;
+                esac
               fi
             done < _author_off.txt
+            if [ -s _deviation.txt ]; then
+              echo "  以下打包类开关作者关闭、我们有意开启（已在本配置里显式表态，仅提示不判）："
+              sed 's/^/    [有意偏离] /' _deviation.txt
+            fi
             sed 's/^/  [被默认值打开!!] /' _reverse.txt
-            echo "  （作者显式关闭 $(wc -l < _author_off.txt) 个符号，其中 $(wc -l < _reverse.txt) 个在我们这里被打开）"
+            echo "  （作者显式关闭 $(wc -l < _author_off.txt) 个符号：非打包类被打开 $(wc -l < _reverse.txt) 个；打包类未表态 $(wc -l < _notstated.txt) 个、设了却被顶回 $(wc -l < _contradict.txt) 个、有意偏离 $(wc -l < _deviation.txt) 个）"
             while IFS= read -r sym; do
               if [ -z "$sym" ]; then continue; fi
               act=$(grep -F "$sym=" .config 2>/dev/null | head -1 || true)
-              emit "反向体检失败｜$sym｜作者显式关闭｜实际 ${act:-=y}｜这类符号有 prompt + default y，不写就等于打开"
+              emit "反向体检失败｜$sym｜作者显式关闭｜实际 ${act:-=y}｜这类符号决定能不能编过，值与作者必须一致"
               fail=1
             done < _reverse.txt
+            while IFS= read -r sym; do
+              if [ -z "$sym" ]; then continue; fi
+              emit "反向体检失败｜$sym｜作者显式关闭，而我的配置里对此**从未表态**｜实际 =y｜这类符号有 prompt + default y，不写就等于打开。若确实要它，请显式写 $sym=y；否则显式写 # $sym is not set"
+              fail=1
+            done < _notstated.txt
+            while IFS= read -r sym; do
+              if [ -z "$sym" ]; then continue; fi
+              emit "反向体检失败｜$sym｜我在配置里写了 is not set，实际却是 y｜说明这条设置被别处 select 顶掉了；请顺着 select 来源查，或改为显式 =y 表态"
+              fail=1
+            done < _contradict.txt
           fi
 
           echo
