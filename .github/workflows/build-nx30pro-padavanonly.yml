@@ -464,6 +464,47 @@ jobs:
           # 作者用的是 n，本方案跟随作者，不做无依据的偏离。
           chk_off CONFIG_WARP_NEW_FW "跟随作者取默认 n（两条分支的文件都存在，不是缺件）"
 
+          # ── §3b 作者「显式关闭」块 ★★ run #2 编译失败的根因 ★★ ─────────────
+          # 作者 defconfig（defconfig/mt7981-ax3000.config）**末尾**有一段追加块，
+          # 把下列符号逐个显式关掉。它们在 package/mtk/drivers/mt_wifi/config.in 里
+          # 全都是 `bool "…"`（有 prompt）+ `default y`
+          # ⇒ **不写 = 打开**，而 Kconfig 对此完全静默（不报错、不警告）。
+          #
+          # 代价（真实发生）：PRE_CAL_TRX_SET1/SET2_SUPPORT 被打开后，mt_wifi 的
+          # eeprom.c 会去引用这棵树里**根本没有定义**的宏 ——
+          #   PRE_CAL_SIZE_ONE_CARD / PRECALPART_OFFSET / DCOC_IMAGE_SIZE /
+          #   TXDPD_IMAGE1_SIZE / TXDPD_IMAGE2_SIZE / DPDPART1_OFFSET / DPDPART2_OFFSET
+          # （eeprom.c 里 PRE_CAL_SIZE_ONE_CARD 只出现 1 次，就是那处引用；
+          #   全树搜索零定义。）⇒ 第 11 步编译 199 分钟后 `exit code 2`，
+          #   报错是 package/mtk/drivers/mt_wifi failed to build。
+          #
+          # ⚠️ CONFIG_MTK_BAND_STEERING 在作者文件里**出现两次**：
+          #      L98  `CONFIG_MTK_BAND_STEERING=y`
+          #      L332 `# CONFIG_MTK_BAND_STEERING is not set`
+          #    kconfig 的 conf_read_simple **不查重复**，逐行无条件赋值
+          #    ⇒ **最后一次生效**，真实取值是 n 而不是 y。
+          #    ⇒ **禁止对 .config 做任何去重 / 排序 / 合并**，那会静默改变语义。
+          chk_off CONFIG_MTK_BAND_STEERING \
+                  "作者显式关闭；config.in 里 default y，不写就会被打开"
+          chk_off CONFIG_MTK_DEFAULT_5G_PROFILE \
+                  "作者显式关闭；default y"
+          chk_off CONFIG_MTK_MAC_REPEATER_SUPPORT \
+                  "作者显式关闭；default y"
+          chk_off CONFIG_MTK_MULTI_PROFILE_SUPPORT \
+                  "作者显式关闭；default y"
+          chk_off CONFIG_MTK_PCIE_ASPM_DYM_CTRL_SUPPORT \
+                  "作者显式关闭；default y"
+          chk_off CONFIG_MTK_PRE_CAL_TRX_SET1_SUPPORT \
+                  "★★ 打开它 → eeprom.c 引用未定义宏 → 编译必炸"
+          chk_off CONFIG_MTK_PRE_CAL_TRX_SET2_SUPPORT \
+                  "★★ 打开它 → eeprom.c 引用未定义宏 → 编译必炸"
+          chk_off CONFIG_MTK_RLM_CAL_CACHE_SUPPORT \
+                  "作者显式关闭；default y"
+          chk_off CONFIG_MTK_SNIFFER_RADIOTAP_SUPPORT \
+                  "作者显式关闭；default y"
+          chk_off CONFIG_AFALG_FALLBACK \
+                  "内核符号，跟作者一致（若无 prompt，本函数会自动判为「不适用」而不误报）"
+
           echo "=== 4. 用户态包（沿用上一版已逐条核对过的开关表）==="
           for p in luci luci-compat luci-theme-argon luci-app-argon-config \
                    luci-app-ttyd luci-app-upnp openssh-sftp-server htop zram-swap; do
@@ -640,6 +681,46 @@ jobs:
           echo "  （配置文件里共 $(wc -l < _want_syms.txt) 个赋值符号，其中 $(wc -l < _drop_syms.txt) 个消失）"
           echo "  影子符号（无 prompt 但有 default）本就正常消失；其余若出现，说明那一行等于没写 —— 回配置文件里删掉。"
 
+          # ── §7b 反向体检：作者显式关闭、而我们没关的符号（★ 硬断言）──────
+          # §7 查的是「写了却不生效」；本节查互补的那一半：
+          # **「没写却被默认值悄悄打开」**。这一类更阴险 —— 配置里根本没有那一行，
+          # 所以任何逐行检查都看不见它，只有值能露馅。
+          #
+          # 判据取自**源码树里自带的**作者 defconfig
+          # （defconfig/mt7981-ax3000.config），不联网、不看外部文件。
+          # kconfig 语义是「同一符号最后一行生效」，这里用「只取 is not set 行」
+          # 来复现作者的**有效**取值（作者文件里 BAND_STEERING 出现两次，
+          # 取的是后面那个 n）。
+          #
+          # 排除 CONFIG_TARGET_*：作者那份 defconfig 让一次构建产出 19 个机型，
+          # 我们只编 NX30 Pro —— 那是有意偏离，且由第 1 组的设备数断言兜住。
+          echo
+          echo "=== 7b. 反向体检：作者显式关闭、我们却打开/未提及的符号 ==="
+          AUTHOR_DEF=defconfig/mt7981-ax3000.config
+          if [ ! -f "$AUTHOR_DEF" ]; then
+            echo "  [跳过] 源码树里没有 $AUTHOR_DEF —— 上游若挪位置，本节自动失效而不是误报"
+          else
+            grep -E '^# CONFIG_[A-Za-z0-9_.+-]+ is not set[[:space:]]*$' "$AUTHOR_DEF" \
+              | awk '{print $2}' | sort -u > _author_off.txt
+            : > _reverse.txt
+            while IFS= read -r sym; do
+              if [ -z "$sym" ]; then continue; fi
+              case "$sym" in CONFIG_TARGET_*) continue ;; esac
+              # 用 -x -F 做整行定值匹配：符号里含 `-` `.`，正则会误伤
+              if grep -qxF "$sym=y" .config || grep -qxF "$sym=m" .config; then
+                printf '%s\n' "$sym" >> _reverse.txt
+              fi
+            done < _author_off.txt
+            sed 's/^/  [被默认值打开!!] /' _reverse.txt
+            echo "  （作者显式关闭 $(wc -l < _author_off.txt) 个符号，其中 $(wc -l < _reverse.txt) 个在我们这里被打开）"
+            while IFS= read -r sym; do
+              if [ -z "$sym" ]; then continue; fi
+              act=$(grep -F "$sym=" .config 2>/dev/null | head -1 || true)
+              emit "反向体检失败｜$sym｜作者显式关闭｜实际 ${act:-=y}｜这类符号有 prompt + default y，不写就等于打开"
+              fail=1
+            done < _reverse.txt
+          fi
+
           echo
           if [ "$fail" != "0" ]; then
             # 把关键符号的真实取值打成一条注解 —— 这是「job 日志拿不到」时的
@@ -660,13 +741,71 @@ jobs:
           make -j$(nproc) download || make -j1 download V=s
 
       # ---------------------------------------------------------------
-      # -j 并行编译；失败时自动退回单线程带日志重跑，方便定位。
+      # -j 并行编译；失败时自动退回单线程带详细日志重跑，方便定位。
+      #
+      # ⚠️ 两条硬约束（都是踩出来的）：
+      #   ① **日志必须落盘**。`make` 的输出若只进 stdout，就只存在于 job 日志里，
+      #      而 job 日志下载**需要 repo admin**（匿名一律 403 `Must have admin rights`）。
+      #      实测：run #2 编译 199 分钟失败，公开侧只拿到一句 `exit code 2`，
+      #      连「哪个包炸了」都看不到，只能请人去网页翻 —— 等于没有诊断。
+      #   ② **诊断必须走 ::error::**（→ check-run annotation，公开仓库匿名可读）。
+      #      多行内容用 %0A 转义塞进一条注解；逐行发会撞「每个 check run 最多 50 条注解」上限。
+      #   诊断逻辑**并入本步骤**而不是新开一步 —— 新开一步会让后面所有步骤的页面编号 +1，
+      #   而文档与沟通都按页面编号引用（第 12/13/14 步），改编号的代价比合并大。
       # ---------------------------------------------------------------
       - name: Build firmware
         id: build
         run: |
           cd openwrt
-          make -j$(nproc) || make -j1 V=s
+          mkdir -p "$RUNNER_TEMP/blog"
+          LOG="$RUNNER_TEMP/blog/build.log"
+          rc=0
+          # 并行阶段：全量落盘、不上屏（几百 MB，上屏只会把界面刷爆）
+          if ! make -j$(nproc) > "$LOG" 2>&1; then
+            echo "并行编译失败，改用单线程带详细日志重跑（其余包已编完，只重试失败处）"
+            make -j1 V=s >> "$LOG" 2>&1 || rc=1
+          fi
+          if [ "$rc" = "0" ]; then exit 0; fi
+
+          # ---------- 失败：先把原因推进公开通道，再以失败退出 ----------
+          # 转义顺序：% 必须最先转，否则行内原有的 % 会被当成转义引导符
+          esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS=""} {print $0 "%0A"}'; }
+
+          if [ ! -f "$LOG" ]; then
+            echo "::error title=编译失败::未找到编译日志 $LOG —— 失败可能发生在 make 之前"
+            exit 1
+          fi
+
+          echo "编译日志共 $(wc -l < "$LOG") 行 / $(du -h "$LOG" | cut -f1)"
+          ERRS=$(grep -nE 'make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:|undefined reference|No rule to make target|failed to build' "$LOG" | tail -n 60)
+          TAILB=$(tail -n 60 "$LOG")
+
+          {
+            echo "### 编译失败诊断（run ${{ github.run_number }}）"
+            echo
+            echo "编译日志共 $(wc -l < "$LOG") 行。"
+            echo
+            echo '**① 典型错误行（grep，最多 60 条）**'
+            echo '```'
+            if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(没有匹配到典型错误行，看下面日志尾部)"; fi
+            echo '```'
+            echo
+            echo '**② 日志尾部 60 行**'
+            echo '```'
+            printf '%s\n' "$TAILB"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
+
+          echo "---- 典型错误行 ----"
+          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无匹配)"; fi
+          echo "---- 日志尾部 ----"
+          printf '%s\n' "$TAILB"
+
+          if [ -n "$ERRS" ]; then
+            echo "::error title=编译错误行（最多 60 条）::$(printf '%s\n' "$ERRS" | head -c 20000 | esc)"
+          fi
+          echo "::error title=编译日志尾部 60 行::$(printf '%s\n' "$TAILB" | head -c 20000 | esc)"
+          exit 1
 
       # ---------------------------------------------------------------
       # 产物自检。发现异常就 exit 1 让运行变红 —— 这是有意的。
