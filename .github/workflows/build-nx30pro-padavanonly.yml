@@ -1,0 +1,951 @@
+name: Build ImmortalWrt padavanonly mt798x-6.6 for H3C NX30 Pro NMBM (闭源WiFi + 硬件NAT)
+
+# 触发方式：
+#   1) 手动（Actions 页面 → Run workflow）—— 日常用这个
+#   2) push 改动到下面这两个路径时自动触发
+#
+# 与上一版（build-nx30pro.yml，官方 24.10.6 基座）的关系：
+#   两者互不影响，可共存。产物名与 Release tag 都带 mtwifi 前缀以区分。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'nx30pro-padavanonly-mtwifi.config'
+      - '.github/workflows/build-nx30pro-padavanonly.yml'
+
+permissions:
+  contents: write
+
+env:
+  # ───────────────────────────────────────────────────────────────────────
+  # 上游基座：padavanonly/immortalwrt-mt798x-6.6
+  #   · 这是 immortalwrt 的 openwrt-24.10 线 ＋ MTK 闭源驱动与 HNAT 补丁。
+  #   · 该仓库**没有任何 release tag**，所以只能 pin 到 commit。
+  #   · 默认分支名就是 openwrt-24.10-6.6（实测：commits.atom 里只有这一个）。
+  #   · SRC_COMMIT 是 2026-09-15 实测的该分支 tip。改这里时，
+  #     务必同时核对下面四个 feed SHA（它们也要落在 openwrt-24.10 上）。
+  # ───────────────────────────────────────────────────────────────────────
+  SRC_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
+  SRC_BRANCH: openwrt-24.10-6.6
+  SRC_COMMIT: ec9ef10efc65da1e6d1de4e2c043c0e13d08eed8
+
+  # ───────────────────────────────────────────────────────────────────────
+  # feeds 必须自己 pin。
+  #   上游 feeds.conf.default 写的是**分支名**（openwrt-24.10），是滚动的，
+  #   同一次配置今天编和下周编会拿到不同的包版本。下面四个 SHA 是
+  #   2026-09-15 实测 openwrt-24.10 的 tip，已逐个用 commits.atom 核对过。
+  #
+  # ⚠️ 语法陷阱（scripts/feeds L220-228，逐行读过）：
+  #   写 `url;branch^sha` 是**错的**。因为 L225 先判 `if (init_branch and $branch)`，
+  #   而 split(/;/) 之后 $branch = "openwrt-24.10^sha"（真值），于是会执行
+  #       git clone --depth 1 --branch 'openwrt-24.10^sha' ...
+  #   去克隆一个不存在的分支，直接失败。
+  #   正确写法只有 `url^sha`（不带 ;branch）：
+  #       git clone --depth 1 'url' 'feeds/<name>' && cd 'feeds/<name>' \
+  #         && git fetch --depth=1 origin 'sha' && git checkout 'sha'
+  # ───────────────────────────────────────────────────────────────────────
+  PKG_SHA: 0cb6db25afff9a17be88520bc3fdd8f4c79f80de
+  LUCI_SHA: 80ed8a44f244627c5a9f808d09f4c3d8f985b764
+  ROUTING_SHA: 00619bc7bc60d8b67ecc490121e45298b122cd6e
+  TELEPHONY_SHA: 92892fa285360b8981f62bf4e0a097e6449e7e33
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # GitHub 单个 job 硬上限 360 分钟，留出余量。
+    # 闭源驱动 + warp 会比上一版多编几个内核模块，但量级不变。
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout build recipe
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 磁盘：runner 默认约 14GB 可用，OpenWrt 全量编译（含 toolchain、
+      # build_dir、ccache）很容易冲过这个数——必须先腾地方，否则会在
+      # 编译到一半时报 "No space left on device"。
+      # ---------------------------------------------------------------
+      - name: Free disk space
+        run: |
+          echo "--- before ---"
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/bootstrap \
+                      /usr/share/swift \
+                      /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          echo "--- after ---"
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools python3-pip \
+            rsync unzip zip file wget curl ca-certificates ccache \
+            device-tree-compiler libelf-dev libtool autoconf automake pkg-config \
+            subversion swig texinfo bc cpio squashfs-tools \
+            liblzo2-dev libzstd-dev libgmp-dev libmpc-dev libmpfr-dev \
+            python3-ply python3-yaml ecj fastjar gcc-multilib g++-multilib \
+            nano qemu-utils
+          # 少数镜像缺失的可选包，装不上不影响主流程
+          sudo apt-get install -y --no-install-recommends \
+            upx-ucl antlr3 asciidoc intltool help2man || true
+          # squashfs-tools 提供产物自检要用的 unsquashfs
+          ccache --version | head -1
+          unsquashfs -version | head -1
+
+      # ---------------------------------------------------------------
+      # 取源码。该仓库无 tag，只能 pin commit。
+      #
+      # 做法：先按分支浅克隆（这一步几乎不可能失败），再判断目标 commit
+      # 是否已在浅历史里；不在就按 SHA 增取一次。
+      # 这样既保持「每次都拿到同一棵树」，又不把整条流水线押在
+      # 「服务端允许按 SHA 取」这一个前提上。
+      # ---------------------------------------------------------------
+      - name: Clone ImmortalWrt source (padavanonly mt798x-6.6, pinned)
+        run: |
+          git clone --depth=1 --branch "${SRC_BRANCH}" "${SRC_REPO}" openwrt
+          cd openwrt
+
+          if git rev-parse --verify -q "${SRC_COMMIT}^{commit}" >/dev/null 2>&1; then
+            echo "浅克隆已包含目标 commit（分支 tip 与 pin 值一致）"
+          else
+            echo "目标 commit 不在浅历史里，按 SHA 增取 …"
+            git fetch --depth=1 origin "${SRC_COMMIT}"
+          fi
+
+          git checkout -q --detach "${SRC_COMMIT}"
+
+          # 硬断言：拿到的必须就是 pin 的那一棵树。
+          # 注意 git rev-parse 是纯本地操作，不会因为网络问题变成「空字符串」。
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "HEAD = ${HEAD_SHA}"
+          if [ "${HEAD_SHA}" != "${SRC_COMMIT}" ]; then
+            echo "::error::源码 commit 不符：期望 ${SRC_COMMIT}，实际 ${HEAD_SHA}"
+            exit 1
+          fi
+          git log -1 --format='%H %ci %s'
+
+          echo
+          echo "=== 关键目录是否随源码一起到位（缺失则后面必然中途失败）==="
+          for d in package/mtk/drivers/mt_wifi \
+                   package/mtk/drivers/warp \
+                   package/mtk/drivers/conninfra \
+                   package/mtk/drivers/wifi-profile \
+                   package/mtk/applications/mtwifi-cfg \
+                   package/mtk/applications/luci-app-mtwifi-cfg \
+                   target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_hnat \
+                   defconfig ; do
+            if [ -d "$d" ]; then echo "  [就位] $d"; else echo "::error::$d 不存在"; exit 1; fi
+          done
+
+          echo
+          echo "=== version.mk 的兜底版本（用于交叉印证 VERSION_REPO 取值）==="
+          grep -nE 'VERSION_NUMBER\)?,24\.10|VERSION_REPO\)?,https' include/version.mk || true
+
+          echo
+          echo "=== 上游 feeds.conf.default（**是分支名，未 pin** —— 我们会在下一步覆盖它）==="
+          cat feeds.conf.default
+
+      # ---------------------------------------------------------------
+      # 覆盖 feeds.conf.default，把四个 feed 全部 pin 到 commit。
+      #
+      # 注意：写 .default 而不是 feeds.conf —— scripts/feeds L91-92 是
+      #     parse_file("feeds.conf", ...) or parse_file("feeds.conf.default", ...)
+      # 所以只要 feeds.conf 不存在，.default 就会生效（这是上游约定）。
+      # 但若克隆下来的树里恰好带着一个 feeds.conf，它会抢先。先删掉。
+      # ---------------------------------------------------------------
+      - name: Pin feeds to exact commits
+        run: |
+          cd openwrt
+          rm -f feeds.conf
+          {
+            echo "src-git packages  https://github.com/immortalwrt/packages.git^${PKG_SHA}"
+            echo "src-git luci      https://github.com/immortalwrt/luci.git^${LUCI_SHA}"
+            echo "src-git routing   https://github.com/openwrt/routing.git^${ROUTING_SHA}"
+            echo "src-git telephony https://github.com/openwrt/telephony.git^${TELEPHONY_SHA}"
+          } > feeds.conf.default
+
+          echo "=== 覆盖后的 feeds.conf.default ==="
+          cat feeds.conf.default
+
+          n=$(grep -c '\^[0-9a-f]\{40\}$' feeds.conf.default || true)
+          echo "已 pin 的 feed 数：${n}（应为 4）"
+          if [ "${n}" != "4" ]; then
+            echo "::error::feeds 未全部 pin 到 commit"
+            exit 1
+          fi
+          # 反向自查：绝不能出现 `;分支^sha` 这种会被 scripts/feeds 误判的写法
+          if grep -q ';[^ ]*\^' feeds.conf.default; then
+            echo "::error::feeds.conf.default 里同时出现了 ;branch 与 ^commit —— 见文件头语法陷阱说明"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # ccache：第二次及以后的编译能从数小时降到几十分钟。
+      # 首次编译没有命中，属于正常现象。
+      # ---------------------------------------------------------------
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/.ccache
+            ~/.ccache
+          key: ccache-nx30pro-mtwifi-${{ env.SRC_COMMIT }}-${{ hashFiles('nx30pro-padavanonly-mtwifi.config') }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-nx30pro-mtwifi-${{ env.SRC_COMMIT }}-${{ hashFiles('nx30pro-padavanonly-mtwifi.config') }}-
+            ccache-nx30pro-mtwifi-${{ env.SRC_COMMIT }}-
+            ccache-nx30pro-mtwifi-
+
+      - name: Update and install feeds (pinned)
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+
+          echo
+          echo "=== 复核每个 feed 的实际 HEAD 是否等于 pin 值 ==="
+          # 这一节是本节的存在意义：feeds 的 pin 走的是
+          #   git clone --depth 1 url dir && git fetch --depth=1 origin SHA && git checkout SHA
+          # 只要服务端行为有任何变化，就可能悄悄给出分支 tip 而不是 pin 的 commit。
+          # 那样构建照样全绿，只是包版本漂了。所以逐个复核。
+          fail=0
+          for spec in "packages:${PKG_SHA}" "luci:${LUCI_SHA}" \
+                      "routing:${ROUTING_SHA}" "telephony:${TELEPHONY_SHA}"; do
+            name="${spec%%:*}"
+            want="${spec##*:}"
+            if [ ! -d "feeds/${name}/.git" ]; then
+              echo "::error::feeds/${name} 未克隆成功"
+              fail=1
+              continue
+            fi
+            got=$(git -C "feeds/${name}" rev-parse HEAD)
+            if [ "${got}" = "${want}" ]; then
+              echo "  [OK]      feeds/${name} @ ${got}"
+            else
+              echo "::error::feeds/${name} 版本漂移：期望 ${want}，实际 ${got}"
+              fail=1
+            fi
+          done
+          if [ "${fail}" != "0" ]; then
+            echo "::error::feeds pin 校验未通过，已中止（继续编只会得到一个版本漂移的固件）"
+            exit 1
+          fi
+
+          ./scripts/feeds install -a
+
+      # ---------------------------------------------------------------
+      # 装载配置并做硬校验。
+      #
+      # 为什么这一步是整个流程里最重要的：
+      #   kconfig 对「拼错的符号」「不存在的包名」「没有 prompt 的符号」
+      #   的处理方式一律是——静默丢弃，不报错。于是 CI 全绿，你刷进去
+      #   却发现没有闭源 WiFi、或者无线 HNAT 被关掉了。
+      #   下面这些 grep 就是把静默失败变成构建失败。
+      #
+          # 断言分层的原则（详见配置文件 §三「铁律 A」，含 kconfig 源码依据）：
+          #   · 有 prompt 的符号才是权威入口 —— 断言打在这类上。
+          #   · 无 prompt 的符号分两种，别一刀切：
+          #       有 default ⇒ 行会出现（携带默认值），整行断言能过但只是复读
+          #                    默认值，只能当「上游改默认值」的回归探针；
+          #       无 default ⇒ 整行不出现，整行断言必然误报，禁止。
+          #     本配置里 MTK_CHIP_MT7981（由 MTK_FIRST_IF_MT7981 select 拉起）
+          #     属前者，MTK_RT_FIRST_IF_RF_OFFSET / MTK_RT_FIRST_CARD_EEPROM
+          #     也属前者（已在下方标注为回归探针）。
+      #   · 比对用**全行相等**（grep -x)，不是「出现即可」：
+      #     `CONFIG_PACKAGE_kmod-mt_wifi=y` 与
+      #     `# CONFIG_PACKAGE_kmod-mt_wifi is not set` 都在同一份文件里，
+      #     模糊匹配会给出假绿。
+      # ---------------------------------------------------------------
+      - name: Load config and verify selections
+        id: config
+        run: |
+          cd openwrt
+          cp ../nx30pro-padavanonly-mtwifi.config .config
+          # ── 文件自证：先证明「这一次跑的到底是哪一版文件」，再谈断言 ──────
+          # 2026-09-15 的教训：首次失败时连「跑的是不是最新脚本」都无法确认
+          # （网页上传的版本 vs 本地版本），只能靠猜。这里把两个文件（配置 +
+          # 本工作流自身）的 sha256 直接打进日志，与本地对账即知。
+          # 之所以能对工作流文件本身取 sha256：actions/checkout 已把仓库
+          # 检出到 $GITHUB_WORKSPACE，而 openwrt/ 是它内部的另一个克隆。
+          echo "=== 0. 本次运行所用文件的自证（与本地 sha256 对账）==="
+          sha256sum ../nx30pro-padavanonly-mtwifi.config || true
+          sha256sum "${GITHUB_WORKSPACE}/.github/workflows/build-nx30pro-padavanonly.yml" || true
+          make defconfig
+
+          fail=0
+          nerr=0
+
+          # ── 为什么失败必须走 ::error::（这不是风格问题，是可用性硬要求）────
+          # ::error:: 会被 GitHub 记成 check-run 的 annotation，而 annotation
+          # 在**公开仓库上可匿名读取**：
+          #     GET /repos/{owner}/{repo}/check-runs/{job_id}/annotations
+          # 普通 echo 只写进 job 日志，而**下载 job 日志需要仓库 admin 权限**
+          # （api.github.com/.../actions/jobs/{id}/logs 匿名返回 403
+          #   "Must have admin rights to Repository."）。
+          # 2026-09-15 首次构建正是栽在这里：第 9 步失败，但拿不到任何失败
+          # 明细，只能靠猜。⇒ 规矩：CI 自检的每条失败都发 ::error::，并把
+          # 「期望 vs 实际」一并写进消息；多行用 %0A 转义。
+          # annotation 单 run 上限 50 条 ⇒ 逐条发到 40 条后只计数不重发。
+          emit() {
+            nerr=$((nerr + 1))
+            if [ "$nerr" -le 40 ]; then
+              echo "::error::$1"
+            fi
+          }
+
+          chk_on() {   # chk_on  <符号>  <说明>   必须是 =y
+            if grep -q "^$1=y$" .config; then
+              echo "  [OK]      $1"
+            else
+              act=$(grep -F "$1=" .config | head -1 || true)
+              echo "  [缺失!!]  $1  ($2)"
+              echo "            实际: ${act:-（该符号整行不存在于 .config）}"
+              emit "chk_on 失败｜$1｜期望 =y｜实际 ${act:-整行不存在}｜${2:-}"
+              fail=1
+            fi
+          }
+          chk_off() {  # chk_off <符号>  <说明>   必须是 is not set
+            if grep -q "^# $1 is not set$" .config; then
+              echo "  [已关闭]  $1"
+            elif grep -q "^$1=y$" .config; then
+              act=$(grep -F "$1=" .config | head -1 || true)
+              echo "  [未关闭!] $1  ($2)"
+              echo "            实际: ${act:-?}"
+              emit "chk_off 失败｜$1｜期望 is not set｜实际 ${act:-=y}｜${2:-}"
+              fail=1
+            else
+              echo "  [不适用]  $1  （符号不存在或没有 prompt）"
+            fi
+          }
+          chk_eq() {   # chk_eq  <完整行>  <说明>   全行相等
+            if grep -q -x -F "$1" .config; then
+              echo "  [OK]      $1"
+            else
+              act=$(grep -F "${1%%=*}=" .config | head -1 || true)
+              echo "  [不符!!]  $1"
+              echo "            实际: ${act:-（整行不存在）}"
+              emit "chk_eq 失败｜期望 [$1]｜实际 [${act:-整行不存在}]｜${2:-}"
+              fail=1
+            fi
+          }
+          chk_absent() { # chk_absent <符号>   该符号不得以任何形式被选中
+            if grep -q "^$1=" .config; then
+              act=$(grep -F "$1=" .config | head -1 || true)
+              echo "  [不该存在!] $1"
+              echo "            实际: ${act:-?}"
+              emit "chk_absent 失败｜$1｜不该被选中｜实际 ${act:-?}"
+              fail=1
+            else
+              echo "  [不存在]  $1"
+            fi
+          }
+
+          echo "=== 1. 目标 / 子目标 / 设备 / 负号移除 ==="
+          chk_on CONFIG_TARGET_mediatek "目标符号丢了，整份配置会退化成默认目标"
+          chk_on CONFIG_TARGET_mediatek_filogic \
+                 "仓库 SUBTARGETS 是 filogic mt7622 mt7623 mt7629，没有 mt7981 子目标"
+          chk_absent CONFIG_TARGET_mediatek_mt7981 \
+                     "这是上游改名前留下的失效符号，作者 defconfig 里就是它 —— 出现说明改错了"
+          chk_on CONFIG_TARGET_MULTI_PROFILE \
+                 "关掉后设备符号不再是 CONFIG_TARGET_DEVICE_...，整个设备选择都失效"
+          chk_on CONFIG_TARGET_PER_DEVICE_ROOTFS \
+                 "它是负号移除生效的前提（见 image.mk L582 ifdef）"
+          chk_on CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_h3c_magic-nx30-pro-nmbm \
+                 "设备未被选中，产物里不会有你的机器"
+          # ↓↓↓ 本工作流最重要的一条断言 ↓↓↓
+          # 它同时证明三件事：字符串符号有 prompt 因此值被保留、负号项
+          # 原样落到了最终 .config、mt7981-wo-firmware 被刻意保留。
+          chk_eq 'CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_h3c_magic-nx30-pro-nmbm="-kmod-mt7915e -kmod-mt7981-firmware"' \
+                 "负号移除未生效 ⇒ 开源 mt76 会与闭源 mt_wifi 争抢同一块 WMAC"
+          # 只应选中一个设备。作者原文件里有 19 组（其中 1 组是失效符号），
+          # 全选上会一次编 17 个多余机型的镜像，白白拉长构建时间。
+          ndev=$(grep -c '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config || true)
+          echo "  选中的设备数：${ndev}（应为 1）"
+          if [ "${ndev}" != "1" ]; then
+            echo "::error::选中的设备数不是 1，检查 CONFIG_TARGET_DEVICE_* 段"
+            fail=1
+          fi
+
+          echo "=== 2. 闭源 WiFi / HNAT 的包（拼写取自仓库内各 Makefile 的 KernelPackage 名）==="
+          # 依赖链（package/mtk/drivers/mt_wifi/Makefile L286-291）：
+          #   kmod-mt_wifi → +wifi-dats +kmod-conninfra +kmod-mediatek_hnat +kmod-warp
+          # 也就是说后四个不显式写也会被拉进来；这里显式断言是为了让
+          # 「依赖解析没把人拉进来」这种情况也能被抓住。
+          for p in kmod-mt_wifi kmod-conninfra kmod-mediatek_hnat kmod-warp \
+                   wifi-dats mtwifi-cfg luci-app-mtwifi-cfg \
+                   wireless-tools wireless-regdb iw iwinfo wifi-scripts; do
+            chk_on "CONFIG_PACKAGE_$p" "该包缺失，闭源 WiFi 或 HNAT 起不来"
+          done
+          # wifi-profile 与 wifi-scripts 都会装 /sbin/wifi，同选必然文件冲突。
+          # 作者刻意只选 wifi-scripts，本方案跟随。
+          chk_off CONFIG_PACKAGE_wifi-profile "与 wifi-scripts 争 /sbin/wifi"
+
+          # ── wifi-dats 自己的两个开关（package/mtk/drivers/wifi-profile/Makefile L78-85）──
+          # 注意符号名**不带 PACKAGE_ 前缀**：包内 config 段的符号是作者原样声明的，
+          # kconfig 不会自动加前缀（同一 Makefile 里带前缀的，也是作者手写的）。
+          # 这两项都有 prompt（`menuconfig first_card / bool "1st card"` 与
+          # `config first_card_name / string "1st card name"`），所以断言是有效的。
+          # 它们不是装饰：wifi-dats 的 install 段整个被
+          #     [ "$$(CONFIG_first_card_name)" = "MT7981" ] 之类条件包着
+          # （同文件 L129-145），两个条件都不成立就一套 profile 数据都不装，
+          # 结果是无线的 /etc/wireless/l1profile.dat 缺失、闭源驱动起不来，而构建全绿。
+          chk_on  CONFIG_first_card "关掉后 wifi-dats 不装任何 profile 数据"
+          chk_eq 'CONFIG_first_card_name="MT7981"' \
+                  "★ 写错会被静默丢弃 ⇒ l1profile.dat 不进镜像；挡在这里，不等到产物自检才发现"
+
+          echo "=== 3. MTK 驱动内部开关（静默失败的重灾区）==="
+          # 下面这一组是影子符号（无 prompt），只做附带核对、**故意不设失败**。
+          # 判据分两种，别混（见配置文件 §三 铁律 A）：
+          #   · 有 default 的（如 MTK_CHIP_MT7981）⇒ 行会出现，值由 default/select
+          #     推导。断言它「=y」能通过，但那是 select 的结果，不是我们写的。
+          #   · 无 default 的 ⇒ 整行不会出现，断言它必然误报，所以更不能设失败。
+          echo "  --- 影子符号（附带核对，失败仅提示）---"
+          for s in CONFIG_MTK_CHIP_MT7981 CONFIG_MTK_CHIP_MT7986 \
+                   CONFIG_MTK_MT_MAC CONFIG_MTK_WIFI_DRIVER \
+                   CONFIG_MTK_SUPPORT_OPENWRT; do
+            if grep -q "^$s=y$" .config; then
+              echo "  [OK]      $s"
+            elif grep -q "^# $s is not set$" .config; then
+              echo "  [提示]    $s = n（无 prompt 的推导结果，不是配置错误）"
+            else
+              echo "  [提示]    $s 整行未出现（无 prompt 且无 default），属正常"
+            fi
+          done
+          echo "  --- 有 prompt 的符号（这些才是权威入口）---"
+          chk_on CONFIG_MTK_FIRST_IF_MT7981 \
+                 "★ 第一射频接口必须选 MT7981。它是 MTK_CHIP_MT7981 的真身，选错一等芯片型号就全错"
+          chk_on CONFIG_MTK_SECOND_IF_NONE \
+                 "★ NX30 Pro 只有一路 2.4G+5G 组合，第二接口必须是 NONE"
+          chk_on CONFIG_MTK_FIRST_IF_EEPROM_FLASH \
+                 "校准数据必须从闪存 Factory 分区读，否则射频参数是编造值"
+          chk_on CONFIG_MTK_FIRST_IF_IPAILNA \
+                 "★ 这个 choice 的首成员是 ePAeLNA（即默认值），必须显式改成 iPAiLNA"
+          chk_on CONFIG_MTK_MT7981_NEW_FW "新固件加载路径，决定装哪套 RAM code"
+          chk_on CONFIG_MTK_WIFI_FW_BIN_LOAD \
+                 "★★ 不打开它，mt_wifi 的 install 段整段不执行 —— 固件与三个校准文件一个都不装，而 CI 全绿"
+          chk_on CONFIG_MTK_CONNINFRA_APSOC "conninfra 的平台选择"
+          chk_on CONFIG_MTK_CONNINFRA_APSOC_MT7981 \
+                 "★ 该 choice 首成员是 MT7986，不显式选就会给 MT7981 编 MT7986 的平台代码"
+          chk_on CONFIG_MTK_WARP_V2 "warp 驱动版本分支"
+          chk_on CONFIG_WED_HW_RRO_SUPPORT "无线硬件卸载"
+          # 反射断言必须打在**有 prompt** 的符号上。
+          # 原先这里写的是 CONFIG_MTK_CHIP_MT7986 —— 它是 `bool` + `default n`
+          # 的无 prompt 影子符号（config.in L1355-1357），只要第一射频口不是
+          # 7986 就恒为 `# ... is not set`，**永远不可能失败**，等于没有保护。
+          # 真正该盯的是 choice 成员 MTK_FIRST_IF_MT7986（config.in L58-62）：
+          # 它是「Choose First WiFi Interface」的一员，有 prompt，选中 MT7981 时
+          # 它必然是 `# ... is not set`，写错了就会翻成 `=y`。
+          chk_off CONFIG_MTK_FIRST_IF_MT7986 \
+                  "★ 反射断言：第一射频口选成 7986 就会给 7981 编错芯片的代码"
+          chk_off CONFIG_MTK_FIRST_IF_NONE "第一接口不能是 NONE"
+          chk_eq 'CONFIG_MTK_WHNAT_SUPPORT=m' \
+                 "无线 HNAT 支持；tristate 取值，注意是 =m 不是 =y"
+          chk_eq 'CONFIG_WARP_CHIPSET="mt7981"' \
+                 "★ 它有 prompt（warp/config.in），default 却是 mt7988 ⇒ 不写就会去装 7986 的固件"
+          chk_eq 'CONFIG_WARP_VERSION=2' \
+                 "它有 prompt；三个 default 引用的 TARGET_mediatek_mt7622/mt7986/mt7988 全不存在 ⇒ 不写会落到 range 下限 1"
+          # ↓↓ 下面两条是**回归探针**，不是「配置生效」的证据 ↑↑
+          # 这两个符号都没有 prompt，值由各自 default 推导，行会照常出现
+          # （有 default 的无 prompt 符号会被写出，见配置文件 §三 铁律 A）。
+          # 因此它们通过只说明上游默认值仍等于 0xc0000 / "flash"；
+          # 一旦上游改了默认值，这里会亮红 —— 那才是这两条存在的意义。
+          chk_eq 'CONFIG_MTK_RT_FIRST_IF_RF_OFFSET=0xc0000' \
+                 "回归探针：该符号无 prompt，值取自 default 0xc0000"
+          chk_eq 'CONFIG_MTK_RT_FIRST_CARD_EEPROM="flash"' \
+                 "回归探针：值由 MTK_FIRST_IF_EEPROM_FLASH 对应的 default 推导"
+          # WARP_NEW_FW 刻意保持默认 n。实测两条分支指向的是**两个都存在**的文件：
+          #   n → $(PKG_BUILD_DIR)/bin/7981_WOCPU0_RAM_CODE_release.bin（源自 src/bin/）
+          #   y → ./files/mt7981-fw-20231228/7981_WOCPU0_RAM_CODE_release.bin
+          # 作者用的是 n，本方案跟随作者，不做无依据的偏离。
+          chk_off CONFIG_WARP_NEW_FW "跟随作者取默认 n（两条分支的文件都存在，不是缺件）"
+
+          echo "=== 4. 用户态包（沿用上一版已逐条核对过的开关表）==="
+          for p in luci luci-compat luci-theme-argon luci-app-argon-config \
+                   luci-app-ttyd luci-app-upnp openssh-sftp-server htop zram-swap; do
+            chk_on "CONFIG_PACKAGE_$p" "该包静默未被选中，刷完不会有"
+          done
+          chk_on CONFIG_PACKAGE_miniupnpd-nftables "选了 iptables 变体在 firewall4 下不工作"
+          chk_on CONFIG_PACKAGE_zerotier "VPN 主程序缺失，界面会在但没有任何后端"
+          chk_on CONFIG_PACKAGE_luci-app-zerotier "界面缺失，只能靠命令行操作"
+          chk_off CONFIG_ZEROTIER_ENABLE_DEBUG "调试构建，体积更大且无用途"
+          chk_off CONFIG_ZEROTIER_ENABLE_SELFTEST "自测程序，无用途"
+
+          # ⚠ 不要往这个列表里加 kmod-nft-fullcone —— padavanonly 的 fork 没有
+          #   fullconenat-nft 包，该符号在本树里根本不存在（配置文件已刻意不含）。
+          #   2026-09-15 首次构建正是被这条断言拦下的。父目录实测结论：
+          #   package/network/utils/ 下只有 fullconenat（iptables 版），没有
+          #   fullconenat-nft。详见配置文件头部「剔除的作者配置项」第 4 条。
+          for k in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat \
+                   kmod-zram kmod-tcp-bbr kmod-tun \
+                   kmod-inet-diag kmod-netlink-diag kmod-wireguard kmod-sched-cake; do
+            chk_on "CONFIG_PACKAGE_$k" "该模块将来无法用 opkg 补装（vermagic 不同）"
+          done
+
+          echo "  --- passwall ---"
+          chk_on CONFIG_PACKAGE_luci-app-passwall "feeds 里可能没有该包"
+          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Xray "xray 核心缺失，固件将无法代理"
+          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Hysteria "Hysteria2 客户端缺失"
+          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Shadowsocks_Rust_Client "SS 客户端缺失"
+          chk_on CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geodata "geoip/geosite 数据缺失"
+          for k in SingBox Xray_Plugin V2ray_Plugin NaiveProxy \
+                   Shadowsocks_Rust_Server V2ray_Geoview Shadow_TLS \
+                   tuic_client Simple_Obfs Haproxy; do
+            chk_off "CONFIG_PACKAGE_luci-app-passwall_INCLUDE_$k" \
+                    "该组件默认开启，打开会多带 0.14–40 MB 无用二进制"
+          done
+
+          echo "  --- 中文界面 ---"
+          # luci-i18n-* 是 HIDDEN 派生包（luci.mk 给它们 HIDDEN:=1），
+          # 真正带 prompt 的总开关是 LUCI_LANG_zh_Hans，逐包断言作为派生结果核对。
+          chk_on CONFIG_LUCI_LANG_zh_Hans "中文界面总开关；关掉后 LuCI 会退回英文"
+          for p in base firewall package-manager argon-config passwall ttyd upnp zerotier; do
+            chk_on "CONFIG_PACKAGE_luci-i18n-$p-zh-cn" "该应用的汉化包缺失，界面会是英文"
+          done
+
+          echo "=== 5. 构建开关与版本（静默失败的最后一道）==="
+          for k in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_BUILDBOT \
+                   CONFIG_BUILD_LOG CONFIG_JSON_CYCLONEDX_SBOM \
+                   CONFIG_KERNEL_DEBUG_INFO CONFIG_KERNEL_DEBUG_INFO_BTF \
+                   CONFIG_KERNEL_DEBUG_INFO_BTF_MODULES \
+                   CONFIG_TARGET_ALL_PROFILES; do
+            chk_off "$k" "buildbot / 调试专用，打开会大幅拉长编译时间或撑爆磁盘"
+          done
+          # CCACHE / BUILD_LOG 的 prompt 都挂在 DEVEL 上（Config-devel.in：
+          # `bool "Use ccache" if DEVEL`）。DEVEL 不成立时 CCACHE 无 prompt，
+          # 会被算回 n —— 所以下面这条断言其实是 DEVEL 生效的证明。
+          chk_on CONFIG_DEVEL "关掉后 CCACHE 的 prompt 消失，缓存开关会被静默丢弃"
+          chk_on CONFIG_CCACHE "没开缓存，第二次编译仍然要数小时"
+          chk_on CONFIG_JSON_OVERVIEW_IMAGE_INFO "它决定产物里有 profiles.json"
+          # 下面两条用全行相等，是为了把「值被丢弃后回落默认」与
+          # 「值是我们写的」区分开。回落默认恰好也可能落到同一个地址，
+          # 所以再补一条 VERSION_NUMBER 的独立断言（值不同，无法被巧合掩盖）。
+          chk_eq 'CONFIG_VERSION_REPO="https://downloads.immortalwrt.org/releases/24.10-SNAPSHOT"' \
+                 "刷完后 opkg 源地址；本版基座高于 24.10.6，指向同名目录会因版本倒挂拒绝安装"
+          chk_eq 'CONFIG_VERSION_NUMBER="24.10.6-nx30pro-mtwifi"' \
+                 "自定义版本号未生效 ⇒ IMAGEOPT/VERSIONOPT 很可能被丢弃了"
+          chk_on CONFIG_VERSION_FILENAMES "产物名带版本号，便于区分上一版官方基座的固件"
+
+          echo
+          echo "=== 6. 仓库内文件与 feeds 源码目录 ==="
+          # 这里有个必须注意的点：./scripts/feeds install 建的是**符号链接**，
+          # find 默认不跟随，裸用 -type d 永远匹配不到，会 100% 误报。必须 -L。
+          check_src() {
+            if [ -n "$(find -L package/feeds -maxdepth 2 -type d -name "$1" -print -quit 2>/dev/null)" ]; then
+              echo "  [就位]   $1"
+            else
+              echo "::error::$1 在 feeds 中缺失，编译必然中途失败"
+              fail=1
+            fi
+          }
+          for p in luci-app-passwall luci-app-zerotier luci-theme-argon \
+                   xray-core hysteria shadowsocks-rust v2ray-geodata \
+                   chinadns-ng dns2socks ipt2socks microsocks tcping curl zerotier; do
+            check_src "$p"
+          done
+
+          # 闭源驱动那部分不在 feeds 里，在本仓库内。逐个确认在源码树上。
+          echo "  --- 本仓库内的 MTK 包与 HNAT 源码覆盖层 ---"
+          for f in package/mtk/drivers/mt_wifi/Makefile \
+                   package/mtk/drivers/mt_wifi/config.in \
+                   package/mtk/drivers/warp/Makefile \
+                   package/mtk/drivers/conninfra/Makefile \
+                   package/mtk/drivers/wifi-profile/Makefile \
+                   package/mtk/applications/mtwifi-cfg/Makefile \
+                   package/mtk/applications/luci-app-mtwifi-cfg/Makefile \
+                   target/linux/mediatek/files-6.6/drivers/net/ethernet/mediatek/mtk_hnat/hnat.c \
+                   target/linux/mediatek/patches-6.6/999-2745-mtkhnat-add-mtkhnat-driver-support.patch ; do
+            if [ -f "$f" ]; then
+              echo "  [就位]   $f"
+            else
+              echo "::error::$f 不存在 —— 上游目录结构变了，本方案的前提需要重新核对"
+              fail=1
+            fi
+          done
+          # ── fullcone 留痕（不是断言，只为防止「又把官方那行搬回来」）──────
+          # padavanonly 的 fork 只带 iptables 版 fullconenat；官方 ImmortalWrt
+          # 另有 fullconenat-nft（定义 KernelPackage/nft-fullcone）。若哪天本树
+          # 里出现了该目录，说明上游补上了，那时才可以把 kmod-nft-fullcone
+          # 加回配置与断言。刻意不设失败：这是记录，不是判据。
+          if [ -d package/network/utils/fullconenat-nft ]; then
+            echo "  [变化]   本树出现 fullconenat-nft ⇒ nft fullcone 已可用，可考虑把 kmod-nft-fullcone 加回配置"
+          else
+            echo "  [已知]   本树无 fullconenat-nft ⇒ nft fullcone 不可用（配置里已刻意不含该符号）"
+          fi
+          # 负号移除用到的机制必须还在（上游若改了实现，本方案会静默失效）
+          #
+          # 判据只盯**真正的实现点**，不盯名字里恰好带 filter 的函数：
+          #   include/image.mk L561  DEVICE_EXTRA_PACKAGES 取字符串（追加语义）
+          #   include/image.mk L563  merge_packages 逐个 pkg 做「先剔除 -X 与 X，
+          #                          再追加」——这才是负号语义的落点
+          #   include/image.mk L582  ifdef TARGET_PER_DEVICE_ROOTFS 守卫（缺则整段不生效）
+          #   include/image.mk L359  mkfs_packages_remove 生成待删列表
+          echo "  --- 负号移除所依赖的机制是否仍在上游 ---"
+          for pat in 'DEVICE_EXTRA_PACKAGES' 'merge_packages' 'mkfs_packages_remove'; do
+            if grep -rqs "$pat" include/ ; then
+              echo "  [就位]   $pat"
+            else
+              echo "::error::include/ 里找不到 $pat —— 负号移除机制可能已被上游改写，请复核 include/image.mk"
+              fail=1
+            fi
+          done
+          # merge_packages 的内部实现 = 负号语义本体，必须逐字在。
+          # 用 sed 抠出函数体再找，避免被别处的同名片段蹭中。
+          if sed -n '/^define merge_packages/,/^endef/p' include/image.mk 2>/dev/null \
+               | grep -qsF 'patsubst -%,%'; then
+            echo "  [就位]   merge_packages 的「剔除 -X 与 X」实现"
+          else
+            echo "::error::include/image.mk 中 merge_packages 的实现已变，负号移除的语义需重新核对"
+            fail=1
+          fi
+          # 负号项只在 per-device rootfs 下生效（image.mk L582 的 ifdef）
+          if grep -qs 'ifdef TARGET_PER_DEVICE_ROOTFS' include/image.mk; then
+            echo "  [就位]   TARGET_PER_DEVICE_ROOTFS 守卫"
+          else
+            echo "::error::include/image.mk 里找不到 TARGET_PER_DEVICE_ROOTFS 守卫，负号项可能整段不生效"
+            fail=1
+          fi
+          # 刻意**不再**检查 'filter_packages'：该符号只出现在 include/target.mk L122，
+          # 全树没有任何调用点（上游遗留的死函数），拿它当证据等于用无关代码放行。
+          if grep -rqs 'filter_packages' include/ ; then
+            echo "  [备注]   include/target.mk 里仍有 filter_packages，但它是无调用点的死函数，不作为判据"
+          fi
+
+          # ── §7 静默丢弃体检（把 2026-09-15 那次教训通用化）──────────────
+          # Kconfig 对「这棵树里不存在的符号」完全静默：不报错、不警告，只是
+          # 让它从 .config 里消失。kmod-nft-fullcone 就是这么坑掉第一次构建的。
+          # 与其「改一条、跑一次、再发现下一条」，不如把整份配置文件回查一遍，
+          # 一次列出全部消失项。**所以本节放在失败判定之前** —— 失败时也要照打。
+          #
+          # 刻意**不设失败**：无 prompt 的影子符号（MTK_CHIP_MT7986、
+          # VERSIONOPT/IMAGEOPT 组等）本来就会正常消失，把它们做成断言必然误报
+          # （这正是「铁律 A」第 (2) 问的推论）。所以本节只列不判，人工甄别。
+          #
+          # 用 comm 做集合差，而不是逐个 grep：符号里含 `-`、`.`（如
+          # CONFIG_TARGET_DEVICE_..._h3c_magic-nx30-pro-nmbm），写正则容易截断。
+          # 两边都用同一次 sort 排序，保证 comm 的输入有序性一致。
+          echo
+          echo "=== 7. 静默丢弃体检（配置里写了、defconfig 后 .config 里查无此符号）==="
+          grep -oE '^CONFIG_[A-Za-z0-9_.-]+' ../nx30pro-padavanonly-mtwifi.config | sort -u > _want_syms.txt
+          { grep -oE '^CONFIG_[A-Za-z0-9_.-]+' .config || true
+            grep -oE '^# CONFIG_[A-Za-z0-9_.-]+ is not set$' .config \
+              | sed -e 's/^# //' -e 's/ is not set$//' || true
+          } | sort -u > _have_syms.txt
+          comm -23 _want_syms.txt _have_syms.txt > _drop_syms.txt
+          sed 's/^/  [被丢弃] /' _drop_syms.txt
+          echo "  （配置文件里共 $(wc -l < _want_syms.txt) 个赋值符号，其中 $(wc -l < _drop_syms.txt) 个消失）"
+          echo "  影子符号（无 prompt 但有 default）本就正常消失；其余若出现，说明那一行等于没写 —— 回配置文件里删掉。"
+
+          echo
+          if [ "$fail" != "0" ]; then
+            # 把关键符号的真实取值打成一条注解 —— 这是「job 日志拿不到」时的
+            # 救命通道。只挑与闭源驱动 / HNAT / 设备选择 / 版本开关相关的行，
+            # 长度可控，能整条放进一个 annotation（上限 65535 字符）。
+            # 注意 `|| true` 必须在 $( ) 内部：set -e 下命令替换失败会直接
+            # 结束脚本，把后面的诊断全部吞掉。
+            diag=$(grep -E '^(CONFIG_(MTK|WARP|WED|CONNINFRA)_|# CONFIG_(MTK|WARP|WED|CONNINFRA)_|CONFIG_(first|second|third)_card|CONFIG_PACKAGE_(kmod-(mt_wifi|warp|conninfra|mediatek_hnat)|wifi-dats|mtwifi-cfg|luci-app-mtwifi-cfg|wifi-scripts|wifi-profile)|CONFIG_TARGET_(DEVICE|PER_DEVICE|MULTI)|CONFIG_(VERSION|IMAGEOPT|DEVEL|CCACHE|LUCI_LANG))' .config 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g' || true)
+            echo "::error::【诊断】make defconfig 之后，闭源驱动/HNAT/设备选择/版本开关的实际内容：%0A${diag:-（没有匹配到任何行）}"
+            echo "::error::配置自检未通过，已中止（共 ${nerr} 项失败；逐条「期望 vs 实际」见上方 ::error:: 注解，上限 40 条）。"
+            exit 1
+          fi
+          echo "配置自检全部通过。"
+
+      - name: Download package sources
+        run: |
+          cd openwrt
+          make -j$(nproc) download || make -j1 download V=s
+
+      # ---------------------------------------------------------------
+      # -j 并行编译；失败时自动退回单线程带日志重跑，方便定位。
+      # ---------------------------------------------------------------
+      - name: Build firmware
+        id: build
+        run: |
+          cd openwrt
+          make -j$(nproc) || make -j1 V=s
+
+      # ---------------------------------------------------------------
+      # 产物自检。发现异常就 exit 1 让运行变红 —— 这是有意的。
+      #
+      # 但「变红」只应该是一个信号，不应该连累产物交付。为此守两条：
+      #   1) 下面的 Upload 带 if: always() && steps.build.outcome == 'success'
+      #      —— 构建成功过就一定要把产物存下来，不看本步骤的结论；
+      #   2) 本步骤内部把「清单落盘」放在所有断言之前 —— 断言一旦 exit 1，
+      #      生成在它后面的文件就永远不会被创建，会让 artifact 少一份清单。
+      #
+      # 说白了：自检的价值是早发现，不是卡住交付。
+      # ---------------------------------------------------------------
+      - name: Verify artifacts and report sizes
+        id: verify
+        run: |
+          cd openwrt/bin/targets/mediatek/filogic
+          echo "=== 目标镜像 ==="
+          ls -lh *h3c_magic-nx30-pro-nmbm* || true
+          echo
+          echo "=== 本固件的内核 vermagic ==="
+          # 必须用绝对路径。从 bin/targets/mediatek/filogic 往上数三级只到
+          # bin/，下面所有相对路径会整片落空；而且 find 的管道末位是 head
+          # （返回 0），set -e 不会拦，失败是静默的。上一版在这里踩过。
+          cd "$GITHUB_WORKSPACE/openwrt"
+          for d in build_dir bin/packages bin/targets/mediatek/filogic; do
+            [ -d "$d" ] || { echo "::error::工作目录基准错误：$d 不存在（当前 $(pwd)）"; exit 1; }
+          done
+          [ -f .config ] || { echo "::error::.config 不存在（当前 $(pwd)）"; exit 1; }
+          BIN=bin/targets/mediatek/filogic
+
+          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' 2>/dev/null | head -1 || true)
+          if [ -n "$VF" ]; then
+            echo "vermagic = $(cat "$VF")"
+            echo "（本固件与官方发布版的 vermagic 必然不同 ⇒ 官方 kmods 无法事后 opkg 安装。"
+            echo "  闭源驱动所需的 mtkhnat / mtk_warp / mt_wifi 都是一次性编进镜像的，不是事后装的。）"
+          fi
+          echo
+
+          # ── 清单先落盘：必须在下面任何断言之前 ──────────────────────
+          find $BIN -name 'kmod-*.ipk' -printf '%f\n' 2>/dev/null | sort > kmods-built.txt || true
+          cp kmods-built.txt $BIN/kmods-built.txt 2>/dev/null || echo "::warning::未能把 kmods-built.txt 复制进产物目录"
+          cp .config $BIN/config.custom 2>/dev/null || echo "::warning::未能把 .config 复制进产物目录"
+          echo "内核模块清单已落盘：kmods-built.txt（$(wc -l < kmods-built.txt 2>/dev/null || echo 0) 行）"
+          echo
+
+          # ── 本工作流最核心的验收：直接打开产物镜像看里面有什么 ──────
+          #
+          # 为什么不用 bin/targets/.../*.manifest：
+          #   include/image.mk L310-317 的 Image/Manifest 读的是 $(TARGET_DIR_ORIG)，
+          #   而 package/Makefile L117 把它定义为**全局并集**（PACKAGE_INSTALL_FILES
+          #   源自 $(sort $(package-y))，与 per-device rootfs 无关）。
+          #   也就是说 .manifest 会把被我们负号摘掉的 kmod-mt7915e 照样列出来，
+          #   哪怕镜像里根本没有 ⇒ 用它做判据必然假红。
+          #
+          # 也不用 build_dir/*/target-dir-*：那是 per-device rootfs 的暂存目录，
+          # 确实是实物，但它属于构建中间产物，存在与否取决于构建路径细节。
+          #
+          # 真正的实物是镜像本身。本机型的 IMAGE/sysupgrade.bin 是
+          #     sysupgrade-tar | append-metadata
+          # （filogic.mk L1191），也就是一个普通 tar，成员为
+          #     sysupgrade-<board>/{CONTROL,root,kernel}
+          # 其中 root 就是 squashfs（scripts/sysupgrade-tar.sh L56-75）。
+          # 所以可以直接解开来看逐文件清单 —— 这是正向、直接的证据。
+          SYS=$(ls -1 $BIN/*h3c_magic-nx30-pro-nmbm*squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
+          if [ -z "$SYS" ]; then
+            echo "::error::找不到 sysupgrade.bin，无法做镜像内容验收"
+            exit 1
+          fi
+          echo "=== 验收目标：$(basename "$SYS")（$(( $(stat -c %s "$SYS") / 1024 )) KB）==="
+
+          tar -tf "$SYS" > sysupgrade-tar-list.txt 2>/dev/null || true
+          echo "--- tar 成员 ---"
+          cat sysupgrade-tar-list.txt
+          cp sysupgrade-tar-list.txt $BIN/sysupgrade-tar-list.txt 2>/dev/null || true
+
+          # BOARD 名写错会导致 sysupgrade 拒绝刷机（要用 -F 强制），值得记录下来
+          rm -rf /tmp/nxupg
+          mkdir -p /tmp/nxupg
+          tar -xf "$SYS" -C /tmp/nxupg 2>/dev/null || tar --ignore-zeros -xf "$SYS" -C /tmp/nxupg
+          ROOTIMG=$(find /tmp/nxupg -name root -type f | head -1 || true)
+          CTLFILE=$(find /tmp/nxupg -name CONTROL -type f | head -1 || true)
+          [ -n "$CTLFILE" ] && { echo "--- CONTROL ---"; cat "$CTLFILE" || true; }
+          if [ -z "$ROOTIMG" ]; then
+            echo "::error::sysupgrade tar 里找不到 root 成员"
+            exit 1
+          fi
+          echo "root 成员：$(stat -c %s "$ROOTIMG") 字节"
+
+          SQFS_LIST=squashfs-filelist.txt
+          unsquashfs -l "$ROOTIMG" > "$SQFS_LIST" 2>/dev/null || true
+          LINE=$(wc -l < "$SQFS_LIST" 2>/dev/null || echo 0)
+          echo "squashfs 文件条目：${LINE}"
+          cp "$SQFS_LIST" $BIN/squashfs-filelist.txt 2>/dev/null || true
+          if [ "${LINE}" -lt 100 ]; then
+            echo "::error::解不出 squashfs 文件清单（只有 ${LINE} 行），无法验收 —— 不要把它当成通过"
+            exit 1
+          fi
+
+          vfail=0
+          must_have() {  # must_have <路径片段> <说明>
+            if grep -qF "$1" "$SQFS_LIST"; then
+              echo "  [已有]   $1"
+            else
+              echo "::error::镜像内缺少 $1 —— $2"
+              vfail=1
+            fi
+          }
+          must_not() {   # must_not <路径片段> <说明>
+            if grep -qF "$1" "$SQFS_LIST"; then
+              echo "::error::镜像内出现了 $1 —— $2"
+              vfail=1
+            else
+              echo "  [已确认无] $1"
+            fi
+          }
+
+          echo
+          echo "=== 7. 闭源 WiFi 与 HNAT 是否真的进了镜像（正向证据）==="
+          must_have '/mt_wifi.ko'              "闭源 WiFi 驱动缺失，无线等于没有"
+          must_have '/mtk_warp_proxy.ko'       "mt_wifi 的 warp 代理模块缺失"
+          must_have '/mtk_warp.ko'             "warp 驱动缺失，WED 卸载起不来"
+          must_have '/mtkhnat.ko'              "硬件 NAT 模块缺失，HNAT 不会工作"
+          must_have 'WIFI_RAM_CODE_MT7981.bin' "MT7981 射频固件缺失，无线起不来"
+          must_have '7981_WACPU_RAM_CODE_release.bin' "WACPU 固件缺失"
+          must_have '7981_WOCPU0_RAM_CODE_release.bin' "WOCPU 固件缺失（warp 装的），WED 卸载会回退到软件路径"
+          must_have 'mt7981_patch_e1_hdr.bin'  "射频 patch 缺失"
+          must_have 'MT7981_iPAiLNA_EEPROM.bin' "iPAiLNA 兜底校准缺失"
+          must_have 'MT7981_ePAeLNA_EEPROM.bin' "ePAeLNA 兜底校准缺失"
+          must_have '/lib/firmware/e2p'         "e2p 缺失（见 mt_wifi install 段，它与两个 EEPROM 一起装）"
+          # 下面这个是我们**刻意保留**的包（负号项只摘了 kmod-mt7915e 与
+          # kmod-mt7981-firmware）。它由 package/firmware/linux-firmware/mediatek.mk
+          # 提供，装的是 /lib/firmware/mediatek/mt7981_wo.bin，无任何依赖 ——
+          # 所以它不会反过来把 mt7915e 拉回来。确认它在，是为了证明「摘两个、
+          # 留一个」这个取舍真的按预期落地了。
+          must_have 'mt7981_wo.bin' "刻意保留的 WED 固件缺失 ⇒ CONFIG_NET_MEDIATEK_SOC_WED 的初始化可能缺件"
+          # 这三个文件的安装被 CONFIG_MTK_CHIP_MT7981 的守卫包着，
+          # 而它是影子符号 —— 所以「配置自检通过」并不能保证它们进镜像。
+          # 这一条断言是那个静默陷阱的最终验收。
+
+          echo
+          echo "=== 8. 开源 mt76 是否真的被摘掉了（负向证据，本方案的关键）==="
+          must_not '/mt7915e.ko' "开源驱动与闭源驱动争抢同一块 WMAC，会让无线行为不可预测"
+          # 开源射频固件：留着只是无用文件（不与闭源驱动争抢），所以只警告不失败
+          for f in 'mt7981_wm.bin' 'mt7981_rom_patch.bin' 'mt7981_wa.bin'; do
+            if grep -qF "$f" "$SQFS_LIST"; then
+              echo "::warning::镜像内仍有开源射频固件 $f（无害，但说明负号项只生效了一半）"
+            fi
+          done
+
+          echo
+          echo "=== 9. 闭源驱动的用户态组件（内核模块对了但这些没有，无线照样起不来）==="
+          # 这些路径逐个来自包自己的 install 段，不是猜的：
+          #   mtwifi-cfg  (package/mtk/applications/mtwifi-cfg/Makefile L34-49)
+          #     → /lib/netifd/wireless/mtwifi.sh  ← 关键：netifd 就是靠它把闭源驱动
+          #                                       认成无线设备；缺了它 LuCI 里没有无线页签
+          #     → /lib/wifi/mtwifi.sh、/sbin/mtwifi_cfg、/sbin/l1util、/sbin/l1dat(软链)
+          #     → /usr/lib/lua/{inspect,mtwifi_defs,mtwifi_utils,l1dat_parser}.lua
+          #     → /etc/hotplug.d/net/10-mtwifi-detect
+          #   wifi-dats   (package/mtk/drivers/wifi-profile/Makefile L129-145)
+          #     → /etc/wireless/mediatek/* 之后 l1profile.dat 被移到 /etc/wireless/l1profile.dat
+          #     （注意：这段安装被 `CONFIG_first_card_name = MT7981` 的守卫包着，
+          #       所以它是又一个「配置写错就静默不装」的位置 —— 已在上面 §2
+          #       用 chk_on CONFIG_first_card / chk_eq CONFIG_first_card_name
+          #       提前拦住，这里的 must_have 是第二道、也是最终的实物证据。）
+          # 刻意**不装** wifi-profile 包：它提供的是 /sbin/wifi（与 wifi-scripts 冲突）。
+          must_have '/lib/netifd/wireless/mtwifi.sh' "netifd 认不出闭源无线设备，LuCI 里不会有无线配置页"
+          must_have '/sbin/mtwifi_cfg'              "mtwifi 配置工具缺失"
+          must_have '/sbin/l1util'                  "l1util 缺失，无线 profile 无法解析"
+          must_have '/usr/lib/lua/mtwifi_utils.lua' "配置模块缺失"
+          must_have '/10-mtwifi-detect'             "热插拔探测脚本缺失，驱动不会在开机时被拉起"
+          must_have '/etc/wireless/l1profile.dat'   "★ 无线 profile 文件缺失 ⇒ 闭源驱动起不来（多半是 first_card_name 写错）"
+          if grep -qF '/sbin/wifi' "$SQFS_LIST"; then
+            echo "  [已有]   /sbin/wifi（由 wifi-scripts 提供）"
+          else
+            echo "::error::镜像内没有 /sbin/wifi，无线无法初始化（wifi-scripts 没进去？）"
+            vfail=1
+          fi
+
+          echo
+          echo "=== 10. 用户态包实证（不看 .config，看编出来的 ipk）==="
+          for p in xray-core hysteria shadowsocks-rust-sslocal zerotier \
+                   luci-app-passwall luci-app-zerotier; do
+            f=$(find bin/packages -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            if [ -n "$f" ]; then echo "  [已编出] $(basename "$f")"; else
+              echo "::error::$p 未出现在 bin/packages"; vfail=1
+            fi
+          done
+          for p in kmod-nft-socket kmod-nft-tproxy kmod-nft-nat; do
+            f=$(find $BIN -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            if [ -n "$f" ]; then echo "  [已编出] $(basename "$f")"; else
+              echo "::error::$p 缺失，TProxy 透明代理无法工作"; vfail=1
+            fi
+          done
+
+          echo
+          echo "=== 11. 空间账 ==="
+          SZ=$(stat -c %s "$SYS")
+          echo "sysupgrade.bin = $((SZ/1024)) KB"
+          # filogic.mk L1187：IMAGE_SIZE := 65536k
+          if [ "$SZ" -ge 67108864 ]; then
+            echo "::error::镜像超过 IMAGE_SIZE（65536 KB）"
+            vfail=1
+          else
+            echo "IMAGE_SIZE 65536 KB，余量 $(( (67108864 - SZ)/1024 )) KB（刷完后成为 overlay）"
+          fi
+          echo
+          echo "=== 产物目录总占用 ==="
+          du -sh $BIN || true
+
+          if [ "${vfail}" != "0" ]; then
+            echo "::error::产物自检未通过。注意：产物仍会被上传（artifact 是兜底），但 Release 不会发布。"
+            exit 1
+          fi
+          echo "产物自检全部通过。"
+
+      # ---------------------------------------------------------------
+      # 产物落袋。这里的 if 是刻意设计的：
+      #   always()                      —— 上一步（自检）红了也照跑
+      #   && steps.build.outcome == 'success' —— 但构建本身必须成功过
+      # 少了后半句，构建真失败时也会去跑，只会撞上 if-no-files-found: error
+      # 多报一次错；少了前半句，自检脚本的一个笔误就能让几小时的产物打水漂。
+      #
+      # 注意：一旦在 if 里写了状态函数（always/success/failure/cancelled），
+      # 步骤默认带的那个隐式 success() 就失效了，条件完全以这行为准。
+      # ---------------------------------------------------------------
+      - name: Upload firmware
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-nx30pro-mtwifi-nmbm-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/bin/targets/mediatek/filogic/profiles.json
+            openwrt/bin/targets/mediatek/filogic/config.custom
+            openwrt/bin/targets/mediatek/filogic/kmods-built.txt
+            openwrt/bin/targets/mediatek/filogic/squashfs-filelist.txt
+            openwrt/bin/targets/mediatek/filogic/sysupgrade-tar-list.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # 可选：同时发一个 Release，下载更方便（artifact 需要登录 GitHub）。
+      # 不想要可以整段删掉，并把上面的 permissions 一并删掉。
+      #
+      # 条件三条与（AND），刻意与 Upload 不同：
+      #   build success —— 构建成功过
+      #   verify success —— 自检全过（这是 Release 的质量含义）
+      # 但**刻意不看 Upload 的结论**：两条交付路径应当互为冗余而不是串行。
+      # artifact =「编出来就有」的兜底；Release =「过了全部自检」的承诺。
+      #
+      # tag 带 mtwifi- 前缀，避免与上一版（官方基座）工作流的 build-N 冲突。
+      - name: Publish release
+        if: always() && steps.build.outcome == 'success' && steps.verify.outcome == 'success' && github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mtwifi-build-${{ github.run_number }}
+          name: NX30 Pro NMBM 闭源WiFi+HNAT build ${{ github.run_number }}
+          body: |
+            基于 `padavanonly/immortalwrt-mt798x-6.6`（commit `${{ env.SRC_COMMIT }}`）编译的
+            H3C Magic NX30 Pro（NMBM 布局）固件。
+
+            **与上一版（官方 24.10.6 基座）的区别**：本版使用 **MTK 闭源 WiFi 驱动（mt_wifi
+            7.6.6.1-mt7981）+ 硬件 NAT（HNAT / WARP / WED）**，无线性能与转发能力更强。
+
+            内置：PassWall（Xray + Hysteria2 + SS-Rust + geo 数据）、ZeroTier、UPnP、
+            zram-swap、硬件 NAT 与无线硬件卸载。
+
+            刷写方式：
+            · 首次安装 —— 进 U-Boot failsafe 界面（`http://192.168.1.1`），上传
+              `*-nmbm-squashfs-factory.bin`。不要刷 `-bl31-uboot.fip` 与 `-preloader.bin`。
+            · 后续升级 —— 用 `*-nmbm-squashfs-sysupgrade.bin`。
+
+            注意：
+            · 本固件的内核 vermagic 与任何官方发布版都不同，**无法用 opkg 补装内核模块**；
+              用户态包（LuCI 插件、代理核心等）可以正常安装。
+            · 分区表与 DTS 与官方逐字节一致 ⇒ **不需要换 U-Boot**，刷机路径与上一版相同。
+            · 首次刷入后前几分钟 CPU 占用偏高属正常（驱动初始化与固件加载）。
+          prerelease: true
+          files: |
+            openwrt/bin/targets/mediatek/filogic/*h3c_magic-nx30-pro-nmbm*
+            openwrt/bin/targets/mediatek/filogic/kmods-built.txt
+            openwrt/bin/targets/mediatek/filogic/squashfs-filelist.txt
