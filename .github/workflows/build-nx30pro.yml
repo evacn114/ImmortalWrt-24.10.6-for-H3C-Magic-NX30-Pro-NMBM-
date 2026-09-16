@@ -329,11 +329,72 @@ jobs:
       # ---------------------------------------------------------------
       # -j 并行编译；失败时自动退回单线程带日志重跑，方便定位。
       # ---------------------------------------------------------------
+      # ---------------------------------------------------------------
+      # 编译。诊断逻辑**并入本步骤**，不新开一步 —— 新开一步会让后面所有
+      # 步骤的页面编号 +1，而文档与沟通都按页面编号引用。
+      #
+      # 为什么必须自己发 ::error::（这是本工作流最贵教训换来的）：
+      # 公开仓库的 job 日志匿名读不到（API 403 "Must have admin rights"），
+      # 所以「要人去看日志才知道发生了什么」的输出，等于没有输出。
+      # ::error:: 会变成 check-run annotation，**匿名可读**。
+      #
+      # 全量输出也不该上屏：编译日志几百 MB，上屏只会把界面刷爆，
+      # 而且第 3、4 次运行的教训是「编了 4 小时半，公开侧只看得到 exit code 2」。
+      # ⇒ 全量落盘到 $RUNNER_TEMP（不进 artifact），失败时只把**错误行 + 尾部**推出去。
+      # ---------------------------------------------------------------
       - name: Build firmware
         id: build
         run: |
           cd openwrt
-          make -j$(nproc) || make -j1 V=s
+          mkdir -p "$RUNNER_TEMP/blog"
+          LOG="$RUNNER_TEMP/blog/build.log"
+          rc=0
+          # 并行阶段：全量落盘、不上屏（几百 MB，上屏只会把界面刷爆）
+          if ! make -j$(nproc) > "$LOG" 2>&1; then
+            echo "并行编译失败，改用单线程带详细日志重跑（其余包已编完，只重试失败处）"
+            make -j1 V=s >> "$LOG" 2>&1 || rc=1
+          fi
+          if [ "$rc" = "0" ]; then exit 0; fi
+
+          # ---------- 失败：先把原因推进公开通道，再以失败退出 ----------
+          # 转义顺序：% 必须最先转，否则行内原有的 % 会被当成转义引导符
+          esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS=""} {print $0 "%0A"}'; }
+
+          if [ ! -f "$LOG" ]; then
+            echo "::error title=编译失败::未找到编译日志 $LOG —— 失败可能发生在 make 之前"
+            exit 1
+          fi
+
+          echo "编译日志共 $(wc -l < "$LOG") 行 / $(du -h "$LOG" | cut -f1)"
+          ERRS=$(grep -nE 'make(\[[0-9]+\])?: \*\*\*|Error [0-9]+$|error:|fatal error:|undefined reference|No rule to make target|failed to build' "$LOG" | tail -n 60)
+          TAILB=$(tail -n 60 "$LOG")
+
+          {
+            echo "### 编译失败诊断（run ${{ github.run_number }}）"
+            echo
+            echo "编译日志共 $(wc -l < "$LOG") 行。"
+            echo
+            echo '**① 典型错误行（grep，最多 60 条）**'
+            echo '```'
+            if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(没有匹配到典型错误行，看下面日志尾部)"; fi
+            echo '```'
+            echo
+            echo '**② 日志尾部 60 行**'
+            echo '```'
+            printf '%s\n' "$TAILB"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
+
+          echo "---- 典型错误行 ----"
+          if [ -n "$ERRS" ]; then printf '%s\n' "$ERRS"; else echo "(无匹配)"; fi
+          echo "---- 日志尾部 ----"
+          printf '%s\n' "$TAILB"
+
+          if [ -n "$ERRS" ]; then
+            echo "::error title=编译错误行（最多 60 条）::$(printf '%s\n' "$ERRS" | head -c 20000 | esc)"
+          fi
+          echo "::error title=编译日志尾部 60 行::$(printf '%s\n' "$TAILB" | head -c 20000 | esc)"
+          exit 1
 
       # ---------------------------------------------------------------
       # 校验与记录。发现异常就 exit 1 让运行变红 —— 这是有意的。
