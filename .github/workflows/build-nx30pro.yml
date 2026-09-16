@@ -330,11 +330,26 @@ jobs:
       # -j 并行编译；失败时自动退回单线程带日志重跑，方便定位。
       # ---------------------------------------------------------------
       - name: Build firmware
+        id: build
         run: |
           cd openwrt
           make -j$(nproc) || make -j1 V=s
 
-      - name: Collect artifacts and report sizes
+      # ---------------------------------------------------------------
+      # 校验与记录。发现异常就 exit 1 让运行变红 —— 这是有意的。
+      #
+      # 但「变红」只应该是一个信号，不应该连累产物交付。为此这里守两条：
+      #   1) 下面的 Upload 步骤带 if: always() && steps.build.outcome == 'success'
+      #      —— 构建成功过就一定要把产物存下来，不看本步骤的结论；
+      #   2) 本步骤内部把「清单落盘」放在所有断言之前 —— 断言一旦 exit 1，
+      #      生成在它后面的文件就永远不会被创建，会让 artifact 少一份清单。
+      #
+      # 说白了：自检的价值是早发现，不是卡住交付。第 3、4 次运行就是踩在
+      # 这一点上 —— 编译 4 小时半全绿，倒在最后 40 秒的自检脚本上，
+      # 固件明明编好了却拿不到。
+      # ---------------------------------------------------------------
+      - name: Verify artifacts and report sizes
+        id: verify
         run: |
           cd openwrt/bin/targets/mediatek/filogic
           echo "=== 目标镜像 ==="
@@ -358,7 +373,18 @@ jobs:
             [ -d "$d" ] || { echo "::error::工作目录基准错误：$d 不存在（当前 $(pwd)）"; exit 1; }
           done
           [ -f .config ] || { echo "::error::.config 不存在（当前 $(pwd)）"; exit 1; }
-          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' 2>/dev/null | head -1)
+          BIN=bin/targets/mediatek/filogic
+
+          # --- 清单先落盘：必须在下面任何断言之前 ---
+          # 每条都自带兜底。这一步失败也不该让整步红掉 —— 它只是"记录"，
+          # 真正的判断留给下面的断言。
+          find $BIN -name 'kmod-*.ipk' -printf '%f\n' 2>/dev/null | sort > kmods-built.txt || true
+          cp kmods-built.txt $BIN/kmods-built.txt 2>/dev/null || echo "::warning::未能把 kmods-built.txt 复制进产物目录"
+          cp .config $BIN/config.custom 2>/dev/null || echo "::warning::未能把 .config 复制进产物目录"
+          echo "内核模块清单已落盘：kmods-built.txt（$(wc -l < kmods-built.txt 2>/dev/null || echo 0) 行）"
+          echo
+
+          VF=$(find build_dir -name .vermagic -path '*linux-mediatek_filogic*' 2>/dev/null | head -1 || true)
           if [ -n "$VF" ]; then
             echo "vermagic = $(cat "$VF")"
             echo "对照：官方 24.10.6 为 ${UPSTREAM_VERMAGIC}"
@@ -366,11 +392,12 @@ jobs:
           fi
           echo
           echo "=== 本固件自带的内核模块（这就是你拥有的全部 kmod）==="
-          # 先落盘再显示：不要让 tee 直接接 head。head 读满 60 行就关管道，
-          # tee 收到 EPIPE 立刻退出，后面的行根本没被读过，落盘的清单会被截断。
-          find bin/targets/mediatek/filogic -name 'kmod-*.ipk' -printf '%f\n' 2>/dev/null | sort > kmods-built.txt
-          head -60 kmods-built.txt
-          echo "(共 $(wc -l < kmods-built.txt) 个；完整清单已存 kmods-built.txt 并随产物上传)"
+          # 清单本体已在上面落盘，这里只负责显示。
+          # 不要让 tee 直接接 head：head 读满 N 行就关管道，tee 收到 EPIPE
+          # 会立刻退出，后面的行根本没被读过，落盘的清单会被截断 —— 所以
+          # 是「先重定向落盘，再 head 显示」，两步分开。
+          head -60 kmods-built.txt || true
+          echo "(共 $(wc -l < kmods-built.txt 2>/dev/null || echo 0) 个；完整清单已存 kmods-built.txt 并随产物上传)"
           echo
           # 这一节是「实证核对」：不看 .config 里选了什么，只看编译产物里到底有没有。
           # .config 断言能防拼写错误，但防不住「依赖解析没把包拉进来」这种情况。
@@ -465,8 +492,7 @@ jobs:
           done
           echo
           echo "=== 空间账 ==="
-          BIN=bin/targets/mediatek/filogic
-          SYS=$(ls -1 $BIN/*h3c_magic-nx30-pro-nmbm-squashfs-sysupgrade.bin 2>/dev/null | head -1)
+          SYS=$(ls -1 $BIN/*h3c_magic-nx30-pro-nmbm-squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
           if [ -n "$SYS" ]; then
             SZ=$(stat -c %s "$SYS")
             echo "sysupgrade.bin = $((SZ/1024)) KB"
@@ -478,14 +504,24 @@ jobs:
               exit 1
             fi
           fi
-          # 把最终 .config 与自带 kmod 清单一并留存，便于复现与日后对照
-          cp .config $BIN/config.custom
-          cp kmods-built.txt $BIN/kmods-built.txt
+          # .config 与自带 kmod 清单已在上面落盘进产物目录，便于复现与日后对照
           echo
           echo "=== 产物目录总占用 ==="
-          du -sh $BIN
+          du -sh $BIN || true
 
+      # ---------------------------------------------------------------
+      # 产物落袋。这里的 if 是本次修复的核心：
+      #   always()                      —— 上一步（自检）红了也照跑
+      #   && steps.build.outcome == 'success' —— 但构建本身必须成功过
+      # 少了后半句，构建真失败时也会去跑，只会撞上 if-no-files-found: error
+      # 多报一次错；少了前半句，自检脚本的一个笔误就能让 4 小时的产物打水漂。
+      #
+      # 注意：一旦在 if 里写了状态函数（always/success/failure/cancelled），
+      # 步骤默认带的那个隐式 success() 就失效了，条件完全以这行为准。
+      # 所以这里必须自己把「构建成功」写清楚，不能想当然。
+      # ---------------------------------------------------------------
       - name: Upload firmware
+        if: always() && steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-24.10.6-nx30pro-nmbm-${{ github.run_number }}
@@ -500,8 +536,20 @@ jobs:
 
       # 可选：同时发一个 Release，下载更方便（artifact 需要登录 GitHub）。
       # 不想要可以整段删掉，并把上面的 permissions 一并删掉。
+      #
+      # 条件写成三条与（AND），刻意与 Upload 不同：
+      #   steps.build.outcome  == 'success' —— 构建成功过
+      #   steps.verify.outcome == 'success' —— 自检全过（这是 Release 的质量含义）
+      # 但**刻意不看 Upload 的结论**。Upload 与 Release 是两条交付路径，
+      # 应当互为冗余而不是串行：上传碰上配额或偶发故障时，Release 正好是兜底。
+      # 反过来，自检红掉时「发 artifact、不发 Release」——artifact 是存底，
+      # Release 是对外的承诺，两者语义不同，不该用同一个门槛。
+      #
+      # 至于为什么要显式写：只要 if 里出现状态函数（success/always/failure/
+      # cancelled），隐式那条 success() 就不再兜底，条件完全以这行为准。
+      # 与其依赖这条容易记错的默认行为，不如把意图写死。
       - name: Publish release
-        if: github.event_name != 'pull_request'
+        if: always() && steps.build.outcome == 'success' && steps.verify.outcome == 'success' && github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
